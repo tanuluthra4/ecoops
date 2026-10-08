@@ -12,4 +12,5 @@ class Incident:
     avg_temp: Optional[float]
     hot_streak_hours: int
     threshold: float
+    valid_observations: int
     evidence: List[str] = field(default_factory=list)
