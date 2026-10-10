@@ -10,6 +10,8 @@ const MAX_PINNED = 4;
 
 const state = {
     mode: "forecast",
+    hazard: "heat",
+    assessment: null,
     incident: null,
     source: null,
     plan: null,
@@ -45,7 +47,7 @@ const fmtDate8 = (s) =>
 
 function modePath(path) {
     const joiner = path.includes("?") ? "&" : "?";
-    return `${path}${joiner}mode=${encodeURIComponent(state.mode)}`;
+    return `${path}${joiner}mode=${encodeURIComponent(state.mode)}&hazard=${encodeURIComponent(state.hazard)}`;
 }
 
 function updateModeControls() {
@@ -159,9 +161,30 @@ async function loadIncident(refresh = false) {
     setBanners("");
 
     try {
-        const data = await api(modePath("/detect" + (refresh ? "?refresh=true" : "")));
-        state.incident = data;
-        state.source = data.data_source;
+        // Assess heat and cold in parallel. The UI selects the active risk
+        // automatically; the user never has to choose a hazard manually.
+        const suffix = refresh ? "?refresh=true" : "";
+        const modeOnlyPath = (hazard) => `/detect${suffix}${suffix ? "&" : "?"}mode=${encodeURIComponent(state.mode)}&hazard=${hazard}`;
+        const [heat, cold] = await Promise.all([
+            api(modeOnlyPath("heat")),
+            api(modeOnlyPath("cold")),
+        ]);
+        state.assessment = { heat, cold };
+        const triggered = (x) => ["HEAT_EVENT", "FORECAST_HEAT_RISK", "COLD_EVENT", "FORECAST_COLD_RISK"].includes(x.type);
+        const rank = (x) => x.severity === "HIGH" ? 2 : x.severity === "MEDIUM" ? 1 : 0;
+        const candidates = [heat, cold].filter(triggered).sort((a, b) =>
+            rank(b) - rank(a) || (b.hot_streak_hours || 0) - (a.hot_streak_hours || 0));
+        let chosen;
+        if (candidates.length) {
+            chosen = candidates[0];
+        } else {
+            // With no trigger, focus the chart on the rule with the longer
+            // near-threshold streak while still displaying both rules.
+            chosen = (cold.hot_streak_hours || 0) > (heat.hot_streak_hours || 0) ? cold : heat;
+        }
+        state.hazard = chosen.hazard || (chosen.type.includes("COLD") ? "cold" : "heat");
+        state.incident = chosen;
+        state.source = chosen.data_source;
         resetDownstream();
         renderIncident();
     } catch (err) {
@@ -201,32 +224,37 @@ function renderIncident() {
     updatePipeline();
 
     const isForecast = state.mode === "forecast";
-    const isEvent = inc.type === "HEAT_EVENT" || inc.type === "FORECAST_HEAT_RISK";
+    const isCold = state.hazard === "cold";
+    const isEvent = isCold
+        ? inc.type === "COLD_EVENT" || inc.type === "FORECAST_COLD_RISK"
+        : inc.type === "HEAT_EVENT" || inc.type === "FORECAST_HEAT_RISK";
     const rules = d.rules;
     const ts = src.time_standard;
+    const thresholdPhrase = isCold ? "at or below" : "at or above";
+    const hazardName = isCold ? "cold" : "heat";
+    const streakName = isCold ? "cold streak" : "hot streak";
 
     root.innerHTML = `
         <div class="incident-head">
             <div>
                 <div class="eyebrow" id="h-incident">${esc(inc.incident_id)} &middot; ${esc(inc.location)} &middot; ${isForecast ? "7-day forecast risk screening" : "historical demonstration replay"}</div>
-                <h1>${isForecast ? (isEvent ? "Upcoming heat risk identified" : "No qualifying heat risk in forecast") : (isEvent ? "Sustained heat event detected" : "No sustained heat event in this window")}</h1>
+                <h1>${isForecast
+                    ? (isEvent ? `Upcoming ${hazardName} risk identified` : `No qualifying heat or cold risk in forecast`)
+                    : (isEvent ? `Sustained ${hazardName} event detected` : `No sustained heat or cold event in this window`)}</h1>
                 ${isForecast ? `<p class="rule">This is a forecast-based screening signal, not an observed incident or official warning. Forecasts can change; confirm with local authorities and current conditions.</p>` : ""}
-                <p class="rule">Trigger: ${esc(rules.min_streak_hours)} or more consecutive hourly readings at or above
-                ${esc(rules.threshold_c)} &deg;C. MEDIUM from ${esc(rules.min_streak_hours)} h, HIGH from
-                ${esc(rules.high_streak_hours)} h. This is an EcoOps demonstration rule, not a meteorological heatwave
-                definition.</p>
+                <p class="rule">Automatic screening checks both rules: heat at or above ${esc(state.assessment?.heat?.threshold)} &deg;C and cold at or below ${esc(state.assessment?.cold?.threshold)} &deg;C, each for ${esc(rules.min_streak_hours)} consecutive hours (MEDIUM); HIGH from ${esc(rules.high_streak_hours)} h. These are EcoOps demo settings, not official warnings.</p>
             </div>
             <div class="badges">
                 <span class="badge sev-${esc(inc.severity)}">Severity ${esc(inc.severity)}</span>
-                <span class="badge">${isForecast ? (isEvent ? "Forecast risk" : "No forecast trigger") : (isEvent ? "Incident open" : "No incident")}</span>
+                <span class="badge">${isForecast ? (isEvent ? `Forecast ${hazardName} risk` : `No heat/cold trigger`) : (isEvent ? `${hazardName} event` : `No heat/cold event`)}</span>
             </div>
         </div>
 
         <div class="stats">
             <div class="stat ${isEvent ? "hot" : ""}">
-                <div class="label">${isForecast ? "Forecast peak temperature" : "Peak temperature"}</div>
-                <div class="value">${num(inc.max_temp)}<small> &deg;C</small></div>
-                <div class="sub">at ${esc(fmtTime(d.peak_time))} ${esc(ts)}</div>
+                <div class="label">${isCold ? "Lowest temperature" : (isForecast ? "Forecast peak temperature" : "Peak temperature")}</div>
+                <div class="value">${num(isCold ? d.min_temp : inc.max_temp)}<small> &deg;C</small></div>
+                <div class="sub">at ${esc(fmtTime(isCold ? d.min_time : d.peak_time))} ${esc(ts)}</div>
             </div>
             <div class="stat">
                 <div class="label">${isForecast ? "Forecast mean temperature" : "Average temperature"}</div>
@@ -234,11 +262,11 @@ function renderIncident() {
                 <div class="sub">mean of valid readings</div>
             </div>
             <div class="stat ${isEvent ? "hot" : ""}">
-                <div class="label">${isForecast ? "Longest forecast hot streak" : "Longest hot streak"}</div>
+                <div class="label">${isForecast ? `Longest forecast ${streakName}` : `Longest ${streakName}`}</div>
                 <div class="value">${esc(inc.hot_streak_hours)}<small> h</small></div>
                 <div class="sub">${d.longest_streak_start
             ? `${esc(fmtTime(d.longest_streak_start))} to ${esc(fmtTime(d.longest_streak_end))}`
-            : `no hour at or above ${esc(inc.threshold)} &deg;C`}</div>
+            : `no hour ${thresholdPhrase} ${esc(inc.threshold)} &deg;C`}</div>
             </div>
             <div class="stat">
                 <div class="label">${isForecast ? "Forecast hours available" : "Valid observations"}</div>
@@ -277,9 +305,11 @@ function renderEvidence() {
                 <div class="readout" id="readout" aria-live="polite">Hover or touch the chart to read an hour.</div>
                 <div class="legend">
                     <span style="--c:#cfd6df">${isForecast ? "Forecast temperature" : "Observed / historical temperature"}</span>
-                    <span style="--c:var(--hot)">At or above trigger</span>
-                    <span class="shade">Qualifying streak</span>
-                    <span class="dash">${esc(inc.threshold)} &deg;C trigger</span>
+                    <span style="--c:#ff5b3a">Heat threshold reached</span>
+                    <span style="--c:#60a5fa">Cold threshold reached</span>
+                    <span class="shade">Qualifying ${state.hazard} streak</span>
+                    <span class="dash">Heat ${esc(state.assessment?.heat?.threshold ?? 35)} &deg;C</span>
+                    <span class="dash">Cold ${esc(state.assessment?.cold?.threshold ?? 5)} &deg;C</span>
                 </div>
             </div>
             <div class="prov">
@@ -295,7 +325,7 @@ function renderEvidence() {
                     <div><dt>Data kind</dt><dd>${esc(kindLabel)}</dd></div>
                     <div><dt>Retrieved at</dt><dd>${esc(src.retrieved_at || "not recorded")}</dd></div>
                     <div><dt>Data status</dt><dd>${isForecast ? "Forecast model output, not live sensor readings or an official warning." : "Historical data, not a live observation."}</dd></div>
-                    <div><dt>Missing data</dt><dd>Invalid values are excluded from statistics and break a hot streak. ${esc(d.missing_observations)} of ${esc(d.expected_observations)} hours missing here.</dd></div>
+                    <div><dt>Missing data</dt><dd>Invalid values are excluded from statistics and break a ${state.hazard === "cold" ? "cold" : "hot"} streak. ${esc(d.missing_observations)} of ${esc(d.expected_observations)} hours missing here.</dd></div>
                 </dl>
                 <div class="tag-legend" aria-label="Value types used in this app">
                     <span class="tag t-observed">Observed</span>
@@ -314,13 +344,18 @@ function drawChart() {
     const src = state.source;
     const series = inc.details.series;
     const thr = inc.threshold;
+    const heatThr = Number(state.assessment?.heat?.threshold ?? 35);
+    const coldThr = Number(state.assessment?.cold?.threshold ?? 5);
+    const isCold = state.hazard === "cold";
+    const atTrigger = (value, hazard) => hazard === "cold" ? value <= coldThr : value >= heatThr;
+    const thresholdPhrase = isCold ? "at or below" : "at or above";
     const n = series.length;
     if (!n) return;
 
     const W = 900, H = 320, ml = 52, mr = 18, mt = 22, mb = 44;
     const vals = series.map((p) => p.temp_c).filter((v) => v !== null);
-    const yMin = Math.floor(Math.min(...vals, thr) - 2);
-    const yMax = Math.ceil(Math.max(...vals, thr) + 2);
+    const yMin = Math.floor(Math.min(...vals, heatThr, coldThr) - 2);
+    const yMax = Math.ceil(Math.max(...vals, heatThr, coldThr) + 2);
     const step = n > 1 ? (W - ml - mr) / (n - 1) : 0;
     const x = (i) => ml + i * step;
     const y = (v) => mt + ((yMax - v) * (H - mt - mb)) / (yMax - yMin);
@@ -356,14 +391,18 @@ function drawChart() {
 
     let basePath = "";
     let hotPath = "";
+    let coldPath = "";
     let open = false;
     series.forEach((p, i) => {
         if (p.temp_c === null) { open = false; return; }
         basePath += `${open ? "L" : "M"}${x(i)} ${y(p.temp_c)} `;
         open = true;
         const prev = series[i - 1];
-        if (prev && prev.temp_c !== null && prev.temp_c >= thr && p.temp_c >= thr) {
-            hotPath += `M${x(i - 1)} ${y(prev.temp_c)} L${x(i)} ${y(p.temp_c)} `;
+        if (prev && prev.temp_c !== null) {
+            const heatSegment = atTrigger(prev.temp_c, "heat") && atTrigger(p.temp_c, "heat");
+            const coldSegment = atTrigger(prev.temp_c, "cold") && atTrigger(p.temp_c, "cold");
+            if (heatSegment) hotPath += `M${x(i - 1)} ${y(prev.temp_c)} L${x(i)} ${y(p.temp_c)} `;
+            if (coldSegment) coldPath += `M${x(i - 1)} ${y(prev.temp_c)} L${x(i)} ${y(p.temp_c)} `;
         }
     });
 
@@ -371,21 +410,26 @@ function drawChart() {
         ? `<line x1="${x(i)}" x2="${x(i)}" y1="${mt}" y2="${H - mb}" stroke="#5f6a78" stroke-dasharray="2 4" /><text class="axis-label" x="${x(i)}" y="${H - mb - 6}" text-anchor="middle">missing</text>`
         : "")).join("");
 
-    const peakIdx = indexOf[inc.details.peak_time];
+    const markerTime = isCold ? inc.details.min_time : inc.details.peak_time;
+    const markerTemp = isCold ? inc.details.min_temp : inc.max_temp;
+    const peakIdx = indexOf[markerTime];
     const peak = peakIdx === undefined ? "" : `
-        <circle cx="${x(peakIdx)}" cy="${y(inc.max_temp)}" r="5" fill="#0b0d10" stroke="#e8ebf0" stroke-width="2" />
-        <text class="axis-label" x="${x(peakIdx)}" y="${y(inc.max_temp) - 10}" text-anchor="middle" style="fill:#e8ebf0">${num(inc.max_temp)} &deg;C</text>`;
+        <circle cx="${x(peakIdx)}" cy="${y(markerTemp)}" r="5" fill="#0b0d10" stroke="#e8ebf0" stroke-width="2" />
+        <text class="axis-label" x="${x(peakIdx)}" y="${y(markerTemp) - 10}" text-anchor="middle" style="fill:#e8ebf0">${num(markerTemp)} &deg;C</text>`;
 
     $("chart").innerHTML = `
         <svg viewBox="0 0 ${W} ${H}" role="img"
-             aria-label="Hourly temperature from ${esc(fmtTime(series[0].time))} to ${esc(fmtTime(series[n - 1].time))}. Peak ${num(inc.max_temp)} degrees Celsius. Longest streak at or above ${esc(thr)} degrees: ${esc(inc.hot_streak_hours)} hours.">
+             aria-label="Hourly temperature from ${esc(fmtTime(series[0].time))} to ${esc(fmtTime(series[n - 1].time))}. Longest streak ${thresholdPhrase} ${esc(thr)} degrees: ${esc(inc.hot_streak_hours)} hours.">
             ${grid}
             ${shades}
-            <line x1="${ml}" x2="${W - mr}" y1="${y(thr)}" y2="${y(thr)}" stroke="#ffa42e" stroke-dasharray="6 5" stroke-width="1.5" />
-            <text class="axis-label" x="${W - mr}" y="${y(thr) - 6}" text-anchor="end" style="fill:#ffa42e">${esc(thr)} &deg;C trigger</text>
+            <line x1="${ml}" x2="${W - mr}" y1="${y(heatThr)}" y2="${y(heatThr)}" stroke="#ff5b3a" stroke-dasharray="6 5" stroke-width="1.5" />
+            <text class="axis-label" x="${W - mr}" y="${y(heatThr) - 6}" text-anchor="end" style="fill:#ff8a70">Heat ${esc(heatThr)} &deg;C</text>
+            <line x1="${ml}" x2="${W - mr}" y1="${y(coldThr)}" y2="${y(coldThr)}" stroke="#60a5fa" stroke-dasharray="6 5" stroke-width="1.5" />
+            <text class="axis-label" x="${W - mr}" y="${y(coldThr) - 6}" text-anchor="end" style="fill:#60a5fa">Cold ${esc(coldThr)} &deg;C</text>
             ${missing}
             <path d="${basePath}" fill="none" stroke="#cfd6df" stroke-width="1.6" stroke-linejoin="round" />
-            <path d="${hotPath}" fill="none" stroke="#ff5b3a" stroke-width="2.6" stroke-linejoin="round" />
+            <path d="${hotPath}" fill="none" stroke="#ff5b3a" stroke-width="2.8" stroke-linejoin="round" />
+            <path d="${coldPath}" fill="none" stroke="#60a5fa" stroke-width="2.8" stroke-linejoin="round" />
             ${xticks}
             ${peak}
             <line id="guide" x1="0" x2="0" y1="${mt}" y2="${H - mb}" stroke="#8f9aa9" stroke-width="1" visibility="hidden" />
@@ -414,7 +458,7 @@ function drawChart() {
             dot.setAttribute("cy", y(p.temp_c));
             dot.setAttribute("visibility", "visible");
             readout.textContent = `${fmtTime(p.time)} ${src.time_standard}: ${p.temp_c.toFixed(1)} °C` +
-                (p.temp_c >= thr ? "  (at or above trigger)" : "");
+                (atTrigger(p.temp_c) ? `  (trigger reached: ${thresholdPhrase} ${thr} °C)` : "");
         }
     };
     const leave = () => {
@@ -509,7 +553,8 @@ async function generatePlan() {
     state.plan = plan;
 
     if (plan.status !== "RESPONSE_RECOMMENDED") {
-        root.innerHTML = `<div class="empty"><p>No response plan is needed: ${state.mode === "forecast" ? "the available forecast did not meet the configured heat-risk trigger" : "no sustained heat incident was detected in this historical window"}.</p></div>`;
+        const hazardName = state.hazard === "cold" ? "cold" : "heat";
+        root.innerHTML = `<div class="empty"><p>No response plan is needed: ${state.mode === "forecast" ? `the available forecast did not meet the configured ${hazardName}-risk trigger` : `no sustained ${hazardName} event was detected in this historical window`}.</p></div>`;
         return;
     }
 

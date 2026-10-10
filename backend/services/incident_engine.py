@@ -1,18 +1,12 @@
-"""Heat-incident detection from hourly temperature observations.
+"""Heat/cold incident detection from hourly temperature readings.
 
-Operational rule (EcoOps demonstration setting, not a meteorological
-heatwave definition): an incident exists when at least `min_streak_hours`
-consecutive hourly readings are at or above `threshold_c`.
-
-Missing hours (-999 sentinel, non-numeric values, absent timestamps) are
-excluded from statistics AND break a streak, so two hot stretches separated
-by a data gap are never counted as one continuous run.
+EcoOps thresholds are demonstration settings, not official warnings or
+universal meteorological definitions. Missing/invalid hours break a streak.
 """
-
 import math
 from datetime import datetime, timedelta
 
-from config import HEAT_RULES
+from config import HEAT_RULES, COLD_RULES
 
 SENTINEL = -999
 
@@ -20,7 +14,7 @@ SENTINEL = -999
 def _is_valid_reading(value):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return False
-    if math.isnan(value) or math.isinf(value):
+    if not math.isfinite(value):
         return False
     return value != SENTINEL
 
@@ -28,12 +22,12 @@ def _is_valid_reading(value):
 def _parse_hour(key):
     try:
         return datetime.strptime(str(key), "%Y%m%d%H")
-    except ValueError:
+    except (TypeError, ValueError):
         return None
 
 
 def _extract_hourly_grid(weather_data):
-    """List of (datetime, value or None) for every hour first..last."""
+    """Return every hour from first to last timestamp, filling gaps with None."""
     try:
         raw = weather_data["properties"]["parameter"]["T2M"]
     except (KeyError, TypeError):
@@ -46,13 +40,11 @@ def _extract_hourly_grid(weather_data):
         stamp = _parse_hour(key)
         if stamp is not None:
             readings[stamp] = value if _is_valid_reading(value) else None
-
     if not readings:
         return []
 
     grid = []
-    stamp = min(readings)
-    last = max(readings)
+    stamp, last = min(readings), max(readings)
     while stamp <= last:
         grid.append((stamp, readings.get(stamp)))
         stamp += timedelta(hours=1)
@@ -63,20 +55,28 @@ def _iso(stamp):
     return stamp.strftime("%Y-%m-%dT%H:00")
 
 
+def _is_triggered(value, threshold, comparison):
+    return value >= threshold if comparison == "gte" else value <= threshold
+
+
 def _unavailable(rules, message):
+    threshold = rules["threshold_c"]
     return {
         "incident": False,
         "type": "DATA_UNAVAILABLE",
+        "hazard": rules["hazard"],
         "severity": "UNKNOWN",
         "max_temp": None,
         "avg_temp": None,
-        "longest_hot_streak_hours": 0,
-        "threshold": rules["threshold_c"],
+        "longest_hot_streak_hours": 0,  # retained for API compatibility
+        "longest_streak_hours": 0,
+        "threshold": threshold,
         "valid_observations": 0,
         "evidence": [message],
         "min_temp": None,
         "peak_time": None,
         "hours_at_or_above_threshold": 0,
+        "hours_at_or_below_threshold": 0,
         "longest_streak_start": None,
         "longest_streak_end": None,
         "qualifying_streaks": [],
@@ -89,30 +89,35 @@ def _unavailable(rules, message):
     }
 
 
-def detect_heat_incident(weather_data, rules=None):
-    rules = dict(rules or HEAT_RULES)
+def detect_temperature_incident(weather_data, hazard="heat", rules=None):
+    """Detect a sustained heat or cold threshold crossing in hourly data."""
+    if hazard not in {"heat", "cold"}:
+        raise ValueError("hazard must be 'heat' or 'cold'")
+    rules = dict(rules or (HEAT_RULES if hazard == "heat" else COLD_RULES))
+    rules.setdefault("hazard", hazard)
+    rules.setdefault("comparison", "gte" if hazard == "heat" else "lte")
     threshold = rules["threshold_c"]
     min_streak = rules["min_streak_hours"]
     high_streak = rules["high_streak_hours"]
+    comparison = rules["comparison"]
+    triggered_label = "at or above" if comparison == "gte" else "at or below"
 
     grid = _extract_hourly_grid(weather_data)
     valid = [(stamp, value) for stamp, value in grid if value is not None]
-
     if not valid:
         return _unavailable(
-            rules, "NASA POWER returned no valid temperature observations."
+            rules, "No valid hourly temperature observations were available."
         )
 
     values = [value for _, value in valid]
-    max_temp = max(values)
-    min_temp = min(values)
+    max_temp, min_temp = max(values), min(values)
     avg_temp = sum(values) / len(values)
     peak_time = next(stamp for stamp, value in valid if value == max_temp)
+    min_time = next(stamp for stamp, value in valid if value == min_temp)
 
-    runs = []
-    current = []
+    runs, current = [], []
     for stamp, value in grid:
-        if value is not None and value >= threshold:
+        if value is not None and _is_triggered(value, threshold, comparison):
             current.append((stamp, value))
         else:
             if current:
@@ -123,50 +128,53 @@ def detect_heat_incident(weather_data, rules=None):
 
     longest = max(runs, key=len) if runs else []
     longest_hours = len(longest)
-
     incident = longest_hours >= min_streak
-    if longest_hours >= high_streak:
-        severity = "HIGH"
-    elif longest_hours >= min_streak:
-        severity = "MEDIUM"
-    else:
-        severity = "LOW"
-
+    severity = (
+        "HIGH" if longest_hours >= high_streak
+        else "MEDIUM" if longest_hours >= min_streak
+        else "LOW"
+    )
     qualifying = [
         {
             "start": _iso(run[0][0]),
             "end": _iso(run[-1][0]),
             "hours": len(run),
             "peak_temp": round(max(v for _, v in run), 1),
+            "min_temp": round(min(v for _, v in run), 1),
         }
-        for run in runs
-        if len(run) >= min_streak
+        for run in runs if len(run) >= min_streak
     ]
-
     hours_at_or_above = sum(1 for value in values if value >= threshold)
+    hours_at_or_below = sum(1 for value in values if value <= threshold)
     expected = len(grid)
-
+    noun = "hot" if hazard == "heat" else "cold"
     evidence = [
         f"Peak temperature reached {max_temp:.1f}°C",
+        f"Minimum temperature reached {min_temp:.1f}°C",
         f"Average temperature was {avg_temp:.1f}°C",
-        f"Longest period above {threshold:.0f}°C: "
-        f"{longest_hours} consecutive hours",
-        f"{len(values)} valid observations analyzed",
+        f"Longest {noun} period {triggered_label} {threshold:g}°C: {longest_hours} consecutive hours",
+        f"{len(values)} valid hourly observations analyzed",
     ]
 
+    event_type = "HEAT_EVENT" if hazard == "heat" else "COLD_EVENT"
+    no_event_type = "NO_HEAT_EVENT" if hazard == "heat" else "NO_COLD_EVENT"
     return {
         "incident": incident,
-        "type": "HEAT_EVENT" if incident else "NO_HEAT_EVENT",
+        "type": event_type if incident else no_event_type,
+        "hazard": hazard,
         "severity": severity,
         "max_temp": round(max_temp, 1),
         "avg_temp": round(avg_temp, 1),
-        "longest_hot_streak_hours": longest_hours,
+        "longest_hot_streak_hours": longest_hours,  # legacy API/model field
+        "longest_streak_hours": longest_hours,
         "threshold": threshold,
         "valid_observations": len(values),
         "evidence": evidence,
         "min_temp": round(min_temp, 1),
         "peak_time": _iso(peak_time),
+        "min_time": _iso(min_time),
         "hours_at_or_above_threshold": hours_at_or_above,
+        "hours_at_or_below_threshold": hours_at_or_below,
         "longest_streak_start": _iso(longest[0][0]) if longest else None,
         "longest_streak_end": _iso(longest[-1][0]) if longest else None,
         "qualifying_streaks": qualifying,
@@ -178,5 +186,10 @@ def detect_heat_incident(weather_data, rules=None):
             {"time": _iso(stamp), "temp_c": None if value is None else round(value, 2)}
             for stamp, value in grid
         ],
-        "rules": dict(rules),
+        "rules": rules,
     }
+
+
+def detect_heat_incident(weather_data, rules=None):
+    """Backward-compatible heat-only detector entry point."""
+    return detect_temperature_incident(weather_data, "heat", rules=rules)

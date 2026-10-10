@@ -22,10 +22,19 @@ INCIDENT_ID = "ECOOPS-042"
 DEMO_LOCATION = {"name": "Delhi", "lat": 28.6139, "lon": 77.2090}
 DEMO_WINDOW = {"start": "20250501", "end": "20250503"}
 
-# EcoOps operational heat rules (prototype settings, NOT a universal
-# heatwave definition).
+# EcoOps operational heat/cold rules. These are prototype settings, NOT
+# official weather warnings or universal meteorological definitions.
 HEAT_RULES = {
+    "hazard": "heat",
     "threshold_c": 35.0,
+    "comparison": "gte",
+    "min_streak_hours": 4,    # MEDIUM and above
+    "high_streak_hours": 8,   # HIGH
+}
+COLD_RULES = {
+    "hazard": "cold",
+    "threshold_c": 5.0,
+    "comparison": "lte",
     "min_streak_hours": 4,    # MEDIUM and above
     "high_streak_hours": 8,   # HIGH
 }

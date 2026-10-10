@@ -45,33 +45,41 @@ def health():
 
 
 @app.get("/detect")
-def detect(refresh: bool = False, mode: str = "historical"):
-    incident, data_source = build_incident(refresh=refresh, mode=mode)
+def detect(refresh: bool = False, mode: str = "historical", hazard: str = "heat"):
+    if hazard not in {"heat", "cold"}:
+        raise HTTPException(status_code=422, detail="hazard must be 'heat' or 'cold'")
+    incident, data_source = build_incident(refresh=refresh, mode=mode, hazard=hazard)
     return {**incident, "data_source": data_source}
 
 
 @app.get("/response")
-def response(mode: str = "historical"):
-    incident, _ = build_incident(mode=mode)
+def response(mode: str = "historical", hazard: str = "heat"):
+    if hazard not in {"heat", "cold"}:
+        raise HTTPException(status_code=422, detail="hazard must be 'heat' or 'cold'")
+    incident, _ = build_incident(mode=mode, hazard=hazard)
     return generate_response_plan(incident)
 
 
 @app.get("/investigate")
-def investigate(mode: str = "historical"):
-    incident, data_source = build_incident(mode=mode)
+def investigate(mode: str = "historical", hazard: str = "heat"):
+    if hazard not in {"heat", "cold"}:
+        raise HTTPException(status_code=422, detail="hazard must be 'heat' or 'cold'")
+    incident, data_source = build_incident(mode=mode, hazard=hazard)
     context = build_investigation_context(incident, data_source)
     investigation = get_investigator().investigate(context)
     return {"evidence_package": context, "investigation": investigation}
 
 
-def _run_simulation(request: SimulationRequest, mode="historical"):
-    incident, _ = build_incident(mode=mode)
+def _run_simulation(request: SimulationRequest, mode="historical", hazard="heat"):
+    if hazard not in {"heat", "cold"}:
+        raise HTTPException(status_code=422, detail="hazard must be 'heat' or 'cold'")
+    incident, _ = build_incident(mode=mode, hazard=hazard)
     plan = generate_response_plan(incident)
 
     if plan["status"] != "RESPONSE_RECOMMENDED":
         raise HTTPException(
             status_code=409,
-            detail="No response plan exists because the selected data window did not meet the configured heat-risk trigger.",
+            detail="No response plan exists because the selected data window did not meet the configured risk trigger.",
         )
 
     try:
@@ -83,13 +91,13 @@ def _run_simulation(request: SimulationRequest, mode="historical"):
 
 
 @app.get("/simulate")
-def simulate_default(mode: str = "historical"):
-    return _run_simulation(SimulationRequest(), mode=mode)
+def simulate_default(mode: str = "historical", hazard: str = "heat"):
+    return _run_simulation(SimulationRequest(), mode=mode, hazard=hazard)
 
 
 @app.post("/simulate")
-def simulate(request: SimulationRequest, mode: str = "historical"):
-    return _run_simulation(request, mode=mode)
+def simulate(request: SimulationRequest, mode: str = "historical", hazard: str = "heat"):
+    return _run_simulation(request, mode=mode, hazard=hazard)
 
 
 # Serve the frontend from the same origin: http://127.0.0.1:8000/ui/
