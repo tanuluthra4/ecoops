@@ -182,17 +182,25 @@ data/demo_incident.json        created by the fetch step (real NASA POWER respon
 | Port 8000 in use | Pick another: `--port 8001` and open that port |
 | Opened `index.html` by double-clicking | Works only if the backend runs on port 8000; prefer `http://127.0.0.1:8000/` |
 
-## What is implemented, and what is not
+## Implementation status
 
-**Implemented:** everything above, with no cloud dependency.
+EcoOps is a local decision-support prototype that combines weather data, rule-based heat-risk screening, evidence-based investigation, response planning, and resource-allocation simulation.
 
-**AWS integration status:** the repository now includes the AWS open-source Strands Agents SDK and an optional local Ollama-backed investigator. This is not an AWS-hosted deployment and requires the local model to be available. Do not claim the Strands agent ran unless the UI reports `strands ollama` and shows its generated brief in your own demo. Confirm that this satisfies the organisers' interpretation of the current rules before submission.
+- **Forecast screening:** Retrieves hourly Delhi temperature forecasts from Open-Meteo and evaluates them against configurable demonstration thresholds.
+- **Historical replay:** Uses NASA POWER data for a repeatable historical demonstration.
+- **Investigation:** Presents available evidence and distinguishes forecast or historical data, derived metrics, assumptions, and recommendations.
+- **Response planning:** Recommends preparation actions when the configured risk trigger is met.
+- **Resource simulation:** Evaluates action feasibility against available teams, budget, and response time.
+- **Optional AWS open-source component:** EcoOps includes an optional integration with the Strands Agents SDK and a locally hosted Ollama model. This is not an AWS-hosted deployment. The agent is only considered active when the configured integration successfully runs.
 
-## Before you submit
+## Limitations
 
-- [ ] Run `fetch_demo_data.py` and check the numbers against what you expect.
-- [ ] Add and verify the AWS component, and make sure the demo video shows it.
-- [ ] Confirm the submission deadline time on the event schedule page. It listed only "Sunday, Oct 11".
-- [ ] Public GitHub repository, demo video of at most 3 minutes on YouTube (public or unlisted), short write-up.
-- [ ] Optional: publish a blog post on AWS Builder Center and link it (separate prize).
-- [ ] Say in the video that the window is historical and the simulation models allocation, not outcomes.
+EcoOps is a prototype for decision support, not an official warning system. Forecasts are model predictions and may change. The demonstration thresholds and resource costs are assumptions, not official standards or measured operational costs.
+
+The simulation evaluates resource allocation; it does not predict health outcomes, casualties prevented, or temperature reductions. Recommendations require human review before real-world use.
+
+## Running the project
+
+Follow the [Quick start](#quick-start-windows-powershell) instructions to run EcoOps locally. Forecast mode requires internet access. Historical replay can use a previously saved NASA POWER response.
+
+For the demonstration, clearly identify whether the displayed data is forecast or historical, and whether the investigator is running in deterministic or Strands-backed mode.
