@@ -1,9 +1,12 @@
-def build_investigation_context(incident):
+def build_investigation_context(incident, data_source=None):
     """
-    Build the evidence package that will later be sent to Bedrock.
+    Build the evidence package handed to an investigator.
 
-    Only observed and derived values from EcoOps are included.
+    Only observed and derived values from EcoOps are included. The same
+    package can later be given to an LLM-based investigator.
     """
+
+    details = incident.get("details", {})
 
     return {
         "incident": {
@@ -14,20 +17,34 @@ def build_investigation_context(incident):
         },
         "observed_data": {
             "peak_temperature_c": incident["max_temp"],
-            "average_temperature_c": incident["avg_temp"],
-            "valid_observations": incident["valid_observations"]
+            "peak_time": details.get("peak_time"),
+            "lowest_temperature_c": details.get("min_temp"),
+            "valid_observations": incident["valid_observations"],
+            "expected_observations": details.get("expected_observations"),
+            "missing_observations": details.get("missing_observations"),
+            "observation_start": details.get("observation_start"),
+            "observation_end": details.get("observation_end")
         },
         "derived_metrics": {
+            "average_temperature_c": incident["avg_temp"],
             "hot_streak_hours": incident["hot_streak_hours"],
-            "operational_threshold_c": incident["threshold"]
+            "hot_streak_start": details.get("longest_streak_start"),
+            "hot_streak_end": details.get("longest_streak_end"),
+            "hours_at_or_above_threshold": details.get("hours_at_or_above_threshold"),
+            "qualifying_streaks": details.get("qualifying_streaks", []),
+            "operational_threshold_c": incident["threshold"],
+            "rules": details.get("rules", {})
         },
+        "data_source": data_source or {},
         "evidence": incident["evidence"]
     }
 
 
 def build_investigator_prompt(context):
     """
-    Build a strict prompt for the future Bedrock investigator.
+    Build a strict prompt for a future LLM-based investigator
+    (for example an AWS Strands agent). Not used by the deterministic
+    investigator.
     """
 
     return f"""

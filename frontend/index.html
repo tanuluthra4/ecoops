@@ -1,29 +1,89 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 
 <head>
-    <title>EcoOps</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>EcoOps | Environmental incident operations</title>
+    <link rel="icon" href="data:,">
     <link rel="stylesheet" href="style.css">
 </head>
 
 <body>
 
-    <div class="container">
+    <header class="topbar">
+        <div class="brand">
+            <span class="brand-mark" aria-hidden="true"></span>
+            <span class="brand-name">EcoOps</span>
+            <span class="brand-sub">Detect the event. Investigate the evidence. Simulate the response.</span>
+        </div>
 
-        <h1>🌍 EcoOps</h1>
+        <nav class="pipeline" aria-label="Workflow progress">
+            <a href="#sec-incident" data-stage="detected"><i></i>Detected</a>
+            <a href="#sec-investigate" data-stage="investigated"><i></i>Investigated</a>
+            <a href="#sec-plan" data-stage="planned"><i></i>Plan ready</a>
+            <a href="#sec-simulate" data-stage="simulated"><i></i>Simulated</a>
+        </nav>
 
-        <h2>Environmental Operations Center</h2>
+        <div class="mode-controls" aria-label="Data mode controls">
+            <button class="btn ghost small" data-action="switch-mode" id="btn-mode">Historical replay</button>
+            <button class="btn ghost small" data-action="refresh" id="btn-refresh" title="Refresh the currently selected data source">
+                Refresh forecast
+            </button>
+        </div>
+    </header>
 
-        <button onclick="detectIncident()">
-            Detect Incident
-        </button>
+    <main class="layout">
 
-        <div id="result"></div>
+        <div id="banners"></div>
 
-    </div>
+        <section class="panel" id="sec-incident" aria-labelledby="h-incident">
+            <div id="incident-root"></div>
+        </section>
+
+        <section class="panel" id="sec-evidence" aria-labelledby="h-evidence">
+            <div id="evidence-root"></div>
+        </section>
+
+        <section class="panel" id="sec-investigate" aria-labelledby="h-investigate">
+            <div class="panel-head">
+                <div>
+                    <div class="eyebrow">Step 2</div>
+                    <h2 id="h-investigate">Evidence-backed investigation</h2>
+                </div>
+            </div>
+            <div id="investigate-root"></div>
+        </section>
+
+        <section class="panel" id="sec-plan" aria-labelledby="h-plan">
+            <div class="panel-head">
+                <div>
+                    <div class="eyebrow">Step 3</div>
+                    <h2 id="h-plan">Response plan</h2>
+                </div>
+            </div>
+            <div id="plan-root"></div>
+        </section>
+
+        <section class="panel" id="sec-simulate" aria-labelledby="h-simulate">
+            <div class="panel-head">
+                <div>
+                    <div class="eyebrow">Step 4</div>
+                    <h2 id="h-simulate">Response simulation</h2>
+                </div>
+            </div>
+            <div id="simulate-root"></div>
+        </section>
+
+    </main>
+
+    <footer class="footer">
+        EcoOps is a decision-support prototype. Forecasts are model predictions, historical values are retrospective,
+        and simulation inputs are labelled assumptions. Nothing here is an official warning; EcoOps cannot contact
+        people or dispatch teams.
+    </footer>
 
     <script src="app.js"></script>
-
 </body>
 
 </html>

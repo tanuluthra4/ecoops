@@ -1,149 +1,96 @@
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
+from typing import List, Optional
 
-from services.nasa_power import get_weather_data
-from services.incident_engine import detect_heat_incident
-from models.incident import Incident
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
+
+from config import FRONTEND_DIR
+from services.incident_service import build_incident
+from services.investigation import build_investigation_context
+from services.investigator import get_investigator
 from services.response_engine import generate_response_plan
-from services.simulation import simulate_response
-from services.investigation import (
-    build_investigation_context,
-    build_investigator_prompt
+from services.simulation import (
+    DEFAULT_WINDOW_HOURS,
+    SimulationInputError,
+    simulate_with_baseline,
 )
 
-app = FastAPI()
+app = FastAPI(title="EcoOps API")
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-@app.get("/")
+class SimulationRequest(BaseModel):
+    teams: int = Field(2, ge=0, le=1000)
+    budget: float = Field(120, ge=0, le=1_000_000)
+    window_hours: float = Field(DEFAULT_WINDOW_HOURS, gt=0, le=48)
+    action_order: Optional[List[str]] = None
+
+
+@app.get("/", include_in_schema=False)
 def home():
+    return RedirectResponse(url="/ui/")
+
+
+@app.get("/health")
+def health():
     return {"message": "EcoOps API Running"}
 
 
 @app.get("/detect")
-def detect():
+def detect(refresh: bool = False, mode: str = "historical"):
+    incident, data_source = build_incident(refresh=refresh, mode=mode)
+    return {**incident, "data_source": data_source}
 
-    weather = get_weather_data()
-    detection = detect_heat_incident(weather)
-
-    incident = Incident(
-        incident_id="ECOOPS-042",
-        type=detection["type"],
-        severity=detection["severity"],
-        location="Delhi",
-        max_temp=detection["max_temp"],
-        avg_temp=detection["avg_temp"],
-        hot_streak_hours=detection.get(
-            "longest_hot_streak_hours", 0
-        ),
-        threshold=detection.get("threshold", 0),
-        valid_observations=detection.get(
-            "valid_observations", 0
-        ),
-        evidence=detection["evidence"]
-    )
-
-    return incident.__dict__
 
 @app.get("/response")
-def response():
+def response(mode: str = "historical"):
+    incident, _ = build_incident(mode=mode)
+    return generate_response_plan(incident)
 
-    weather = get_weather_data()
-    detection = detect_heat_incident(weather)
-
-    incident = Incident(
-        incident_id="ECOOPS-042",
-        type=detection["type"],
-        severity=detection["severity"],
-        location="Delhi",
-        max_temp=detection["max_temp"],
-        avg_temp=detection["avg_temp"],
-        hot_streak_hours=detection.get(
-            "longest_hot_streak_hours", 0
-        ),
-        threshold=detection.get("threshold", 0),
-        valid_observations=detection.get(
-            "valid_observations", 0
-        ),
-        evidence=detection["evidence"]
-    )
-
-    return generate_response_plan(incident.__dict__)
-
-@app.get("/simulate")
-def simulate():
-
-    weather = get_weather_data()
-    detection = detect_heat_incident(weather)
-
-    incident = Incident(
-        incident_id="ECOOPS-042",
-        type=detection["type"],
-        severity=detection["severity"],
-        location="Delhi",
-        max_temp=detection["max_temp"],
-        avg_temp=detection["avg_temp"],
-        hot_streak_hours=detection.get(
-            "longest_hot_streak_hours", 0
-        ),
-        threshold=detection.get("threshold", 0),
-        valid_observations=detection.get(
-            "valid_observations", 0
-        ),
-        evidence=detection["evidence"]
-    )
-
-    response_plan = generate_response_plan(
-        incident.__dict__
-    )
-
-    resources = {
-        "teams": 2,
-        "budget": 200
-    }
-
-    return simulate_response(
-        response_plan,
-        resources
-    )
 
 @app.get("/investigate")
-def investigate():
+def investigate(mode: str = "historical"):
+    incident, data_source = build_incident(mode=mode)
+    context = build_investigation_context(incident, data_source)
+    investigation = get_investigator().investigate(context)
+    return {"evidence_package": context, "investigation": investigation}
 
-    weather = get_weather_data()
-    detection = detect_heat_incident(weather)
 
-    incident = Incident(
-        incident_id="ECOOPS-042",
-        type=detection["type"],
-        severity=detection["severity"],
-        location="Delhi",
-        max_temp=detection["max_temp"],
-        avg_temp=detection["avg_temp"],
-        hot_streak_hours=detection.get(
-            "longest_hot_streak_hours", 0
-        ),
-        threshold=detection.get("threshold", 0),
-        valid_observations=detection.get(
-            "valid_observations", 0
-        ),
-        evidence=detection["evidence"]
-    )
+def _run_simulation(request: SimulationRequest, mode="historical"):
+    incident, _ = build_incident(mode=mode)
+    plan = generate_response_plan(incident)
 
-    context = build_investigation_context(
-        incident.__dict__
-    )
+    if plan["status"] != "RESPONSE_RECOMMENDED":
+        raise HTTPException(
+            status_code=409,
+            detail="No response plan exists because the selected data window did not meet the configured heat-risk trigger.",
+        )
 
-    prompt = build_investigator_prompt(context)
+    try:
+        result = simulate_with_baseline(plan, request.model_dump())
+    except SimulationInputError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
 
-    return {
-        "evidence_package": context,
-        "investigator_prompt": prompt
-    }
+    return {"incident_id": incident["incident_id"], **result}
+
+
+@app.get("/simulate")
+def simulate_default(mode: str = "historical"):
+    return _run_simulation(SimulationRequest(), mode=mode)
+
+
+@app.post("/simulate")
+def simulate(request: SimulationRequest, mode: str = "historical"):
+    return _run_simulation(request, mode=mode)
+
+
+# Serve the frontend from the same origin: http://127.0.0.1:8000/ui/
+app.mount("/ui", StaticFiles(directory=FRONTEND_DIR, html=True), name="ui")

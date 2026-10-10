@@ -1,5 +1,5 @@
-from dataclasses import dataclass, field
-from typing import List, Optional
+from dataclasses import dataclass, field, asdict
+from typing import Any, Dict, List, Optional
 
 
 @dataclass
@@ -14,3 +14,8 @@ class Incident:
     threshold: float
     valid_observations: int
     evidence: List[str] = field(default_factory=list)
+    # Everything else the engine computed (series, streaks, window, rules...).
+    details: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
