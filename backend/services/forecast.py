@@ -9,6 +9,7 @@ import logging
 import time
 
 import requests
+import os
 
 from config import DEMO_LOCATION, NASA_TIMEOUT_SECONDS
 
@@ -42,141 +43,223 @@ def _unavailable_source(note):
 
 
 
-def load_forecast_bundle(refresh=False):
-    """Return a cached forecast or fetch a new one, respecting rate limits."""
-    global _last_rate_limit_at
+def _parse_hourly_series(entries, time_format, time_key, temp_key):
+    """Convert provider hourly readings to EcoOps' YYYYMMDDHH grid."""
+    series = {}
+    current_hour = datetime.now(INDIA_TZ).replace(
+        minute=0, second=0, microsecond=0
+    ).replace(tzinfo=None)
 
+    for entry in entries:
+        try:
+            stamp = datetime.strptime(entry[time_key], time_format)
+            if stamp < current_hour:
+                continue
+
+            value = entry.get(temp_key)
+            key = stamp.strftime("%Y%m%d%H")
+            series[key] = (
+                value
+                if isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                else -999
+            )
+        except (KeyError, TypeError, ValueError):
+            continue
+
+    if not series:
+        raise ValueError("No usable future hourly temperatures returned.")
+
+    return series
+
+
+def load_forecast_bundle(refresh=False):
+    """Load Open-Meteo forecast, falling back to WeatherAPI if needed."""
     now_mono = time.monotonic()
 
-    # Reuse a successful forecast for one hour, including on manual refresh.
-    if "bundle" in _cache and now_mono - _cache["at"] < CACHE_SECONDS:
+    if (
+        not refresh
+        and "bundle" in _cache
+        and now_mono - _cache["at"] < CACHE_SECONDS
+    ):
         return _cache["bundle"]
 
-    # Avoid repeatedly calling Open-Meteo while rate-limited.
-    if now_mono - _last_rate_limit_at < RATE_LIMIT_COOLDOWN_SECONDS:
-        return {
-            "data": None,
-            "source": _unavailable_source(
-                "Open-Meteo recently rate-limited this service. "
-                "Please wait a few minutes or use historical replay. "
-                "No forecast values were invented."
-            ),
-        }
+    provider = "Open-Meteo"
+    dataset = (
+        "Hourly 2 m air-temperature forecast; "
+        "apparent temperature and relative humidity also requested"
+    )
 
-    params = {
+    open_meteo_params = {
         "latitude": DEMO_LOCATION["lat"],
         "longitude": DEMO_LOCATION["lon"],
-        "hourly": "temperature_2m,apparent_temperature,relative_humidity_2m",
+        "hourly": (
+            "temperature_2m,apparent_temperature,"
+            "relative_humidity_2m"
+        ),
         "forecast_days": FORECAST_DAYS,
         "timezone": TIMEZONE,
         "temperature_unit": "celsius",
     }
 
     try:
-        response = requests.get(
-            FORECAST_URL,
-            params=params,
-            timeout=NASA_TIMEOUT_SECONDS,
-        )
-
-        if response.status_code == 429:
-            _last_rate_limit_at = time.monotonic()
-            logger.warning(
-                "Open-Meteo rate-limited this service (HTTP 429). "
-                "Cooling down for %s seconds.",
-                RATE_LIMIT_COOLDOWN_SECONDS,
+        # Primary provider: Open-Meteo
+        try:
+            response = requests.get(
+                FORECAST_URL,
+                params=open_meteo_params,
+                timeout=NASA_TIMEOUT_SECONDS,
             )
-            return {
-                "data": None,
-                "source": _unavailable_source(
-                    "Open-Meteo is rate-limiting this service. "
-                    "Wait a few minutes or use historical replay. "
-                    "No forecast values were invented."
-                ),
-            }
+            response.raise_for_status()
+            payload = response.json()
+            hourly = payload.get("hourly", {})
+            times = hourly.get("time", [])
+            temps = hourly.get("temperature_2m", [])
 
-        response.raise_for_status()
-        payload = response.json()
-        hourly = payload.get("hourly", {})
-        times = hourly.get("time", [])
-        temps = hourly.get("temperature_2m", [])
-
-        if not times or len(times) != len(temps):
-            raise ValueError(
-                "Forecast response did not contain a complete hourly temperature series."
-            )
-
-        series = {}
-        current_hour = datetime.now(INDIA_TZ).replace(
-            minute=0, second=0, microsecond=0
-        )
-
-        for stamp, value in zip(times, temps):
-            try:
-                local_stamp = datetime.strptime(stamp, "%Y-%m-%dT%H:%M")
-                if local_stamp < current_hour.replace(tzinfo=None):
-                    continue
-
-                key = local_stamp.strftime("%Y%m%d%H")
-                series[key] = (
-                    value
-                    if isinstance(value, (int, float))
-                    and not isinstance(value, bool)
-                    else -999
+            if not times or len(times) != len(temps):
+                raise ValueError(
+                    "Open-Meteo returned an incomplete hourly series."
                 )
-            except (TypeError, ValueError):
-                continue
 
-        if not series:
-            raise ValueError(
-                "Forecast response contained no usable hourly timestamps."
+            entries = [
+                {"time": stamp, "temperature": temp}
+                for stamp, temp in zip(times, temps)
+            ]
+
+            series = _parse_hourly_series(
+                entries,
+                "%Y-%m-%dT%H:%M",
+                "time",
+                "temperature",
             )
 
-    except (requests.RequestException, ValueError, TypeError, KeyError) as exc:
-        logger.warning("Open-Meteo forecast request failed: %s", exc)
-        return {
-            "data": None,
-            "source": _unavailable_source(
-                "Could not retrieve a usable Open-Meteo forecast. "
-                "Check the connection and retry later, or switch to historical replay. "
-                "No forecast values were invented."
+        except (
+            requests.RequestException,
+            ValueError,
+            TypeError,
+            KeyError,
+        ) as primary_error:
+            logger.warning(
+                "Open-Meteo failed; trying WeatherAPI fallback: %s",
+                primary_error,
+            )
+
+            # Secondary provider: WeatherAPI
+            api_key = os.getenv("WEATHERAPI_KEY")
+            if not api_key:
+                raise RuntimeError(
+                    "WEATHERAPI_KEY is not configured."
+                ) from primary_error
+
+            fallback_response = requests.get(
+                "https://api.weatherapi.com/v1/forecast.json",
+                params={
+                    "key": api_key,
+                    "q": (
+                        f'{DEMO_LOCATION["lat"]},'
+                        f'{DEMO_LOCATION["lon"]}'
+                    ),
+                    "days": 3,
+                    "aqi": "no",
+                    "alerts": "no",
+                },
+                timeout=NASA_TIMEOUT_SECONDS,
+            )
+            fallback_response.raise_for_status()
+            fallback_payload = fallback_response.json()
+
+            forecast_days = fallback_payload.get(
+                "forecast", {}
+            ).get("forecastday", [])
+
+            fallback_entries = [
+                hour
+                for day in forecast_days
+                for hour in day.get("hour", [])
+            ]
+
+            series = _parse_hourly_series(
+                fallback_entries,
+                "%Y-%m-%d %H:%M",
+                "time",
+                "temp_c",
+            )
+
+            provider = "WeatherAPI.com"
+            dataset = "Hourly 2 m air-temperature forecast"
+
+            logger.info(
+                "WeatherAPI fallback succeeded with %d hourly readings.",
+                len(series),
+            )
+
+        retrieved_at = datetime.now(timezone.utc).isoformat(
+            timespec="seconds"
+        )
+        start, end = min(series), max(series)
+
+        data = {"properties": {"parameter": {"T2M": series}}}
+
+        if provider == "Open-Meteo":
+            note = (
+                "Open-Meteo forecast model output. These are predictions, "
+                "not observed temperatures or an official warning."
+            )
+        else:
+            note = (
+                "Open-Meteo was unavailable; hourly forecast retrieved "
+                "from WeatherAPI.com. These are predictions, not observed "
+                "temperatures or an official warning. The fallback provides "
+                "up to three forecast days on this configuration."
+            )
+
+        source = {
+            "kind": "forecast",
+            "provider": provider,
+            "dataset": dataset,
+            "location": {
+                "name": DEMO_LOCATION["name"],
+                "lat": DEMO_LOCATION["lat"],
+                "lon": DEMO_LOCATION["lon"],
+            },
+            "window": {
+                "start": datetime.strptime(
+                    start, "%Y%m%d%H"
+                ).strftime("%Y-%m-%d %H:00"),
+                "end": datetime.strptime(
+                    end, "%Y%m%d%H"
+                ).strftime("%Y-%m-%d %H:00"),
+            },
+            "retrieved_at": retrieved_at,
+            "time_standard": "IST (Asia/Kolkata)",
+            "synthetic": False,
+            "is_live": False,
+            "is_forecast": True,
+            "note": note,
+            "forecast_days": (
+                FORECAST_DAYS if provider == "Open-Meteo" else 3
             ),
         }
 
-    retrieved_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    start, end = min(series), max(series)
+        bundle = {"data": data, "source": source}
+        _cache["at"] = time.monotonic()
+        _cache["bundle"] = bundle
+        return bundle
 
-    data = {"properties": {"parameter": {"T2M": series}}}
-    source = {
-        "kind": "forecast",
-        "provider": "Open-Meteo",
-        "dataset": (
-            "Hourly 2 m air-temperature forecast; apparent temperature "
-            "and relative humidity also requested"
-        ),
-        "location": {
-            "name": DEMO_LOCATION["name"],
-            "lat": DEMO_LOCATION["lat"],
-            "lon": DEMO_LOCATION["lon"],
-        },
-        "window": {
-            "start": datetime.strptime(start, "%Y%m%d%H").strftime("%Y-%m-%d %H:00"),
-            "end": datetime.strptime(end, "%Y%m%d%H").strftime("%Y-%m-%d %H:00"),
-        },
-        "retrieved_at": retrieved_at,
-        "time_standard": "IST (Asia/Kolkata)",
-        "synthetic": False,
-        "is_live": False,
-        "is_forecast": True,
-        "note": (
-            "Forecast model output retrieved this session. These are predictions, "
-            "not observed temperatures or an official warning. Forecasts can change."
-        ),
-        "forecast_days": FORECAST_DAYS,
-    }
+    except (
+        requests.RequestException,
+        ValueError,
+        TypeError,
+        KeyError,
+        RuntimeError,
+    ) as exc:
+        logger.error("All forecast providers failed: %s", exc)
 
-    bundle = {"data": data, "source": source}
-    _cache["at"] = time.monotonic()
-    _cache["bundle"] = bundle
-    _last_rate_limit_at = 0.0
-    return bundle
+        unavailable = _unavailable_source(
+            "Open-Meteo and WeatherAPI could not provide a usable forecast. "
+            "Check provider availability and the WEATHERAPI_KEY setting. "
+            "No forecast values were invented."
+        )
+        unavailable["provider"] = "Open-Meteo + WeatherAPI.com"
+
+        return {"data": None, "source": unavailable}
