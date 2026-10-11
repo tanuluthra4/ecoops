@@ -7,7 +7,9 @@
    Heat AND cold are always screened together (GET /assess). There is no
    manual hazard selector; only the data mode (forecast / historical) is chosen. */
 
-const API_BASE = location.protocol === "file:" ? "http://127.0.0.1:8000" : "";
+const API_BASE = location.protocol === "file:"
+    ? "http://127.0.0.1:8000"
+    : "https://ecoops.onrender.com";
 const DEFAULT_CONTROLS = { teams: 2, budget: 120, window: 6 };
 const MAX_PINNED = 4;
 
