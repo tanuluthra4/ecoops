@@ -63,6 +63,7 @@ def _unavailable(rules, message):
     threshold = rules["threshold_c"]
     return {
         "incident": False,
+        "status": "UNAVAILABLE",
         "type": "DATA_UNAVAILABLE",
         "hazard": rules["hazard"],
         "severity": "UNKNOWN",
@@ -75,6 +76,8 @@ def _unavailable(rules, message):
         "evidence": [message],
         "min_temp": None,
         "peak_time": None,
+        "min_time": None,
+        "hours_beyond_threshold": 0,
         "hours_at_or_above_threshold": 0,
         "hours_at_or_below_threshold": 0,
         "longest_streak_start": None,
@@ -160,6 +163,7 @@ def detect_temperature_incident(weather_data, hazard="heat", rules=None):
     no_event_type = "NO_HEAT_EVENT" if hazard == "heat" else "NO_COLD_EVENT"
     return {
         "incident": incident,
+        "status": "RISK_DETECTED" if incident else "NO_RISK",
         "type": event_type if incident else no_event_type,
         "hazard": hazard,
         "severity": severity,
@@ -173,6 +177,7 @@ def detect_temperature_incident(weather_data, hazard="heat", rules=None):
         "min_temp": round(min_temp, 1),
         "peak_time": _iso(peak_time),
         "min_time": _iso(min_time),
+        "hours_beyond_threshold": hours_at_or_above if hazard == "heat" else hours_at_or_below,
         "hours_at_or_above_threshold": hours_at_or_above,
         "hours_at_or_below_threshold": hours_at_or_below,
         "longest_streak_start": _iso(longest[0][0]) if longest else None,

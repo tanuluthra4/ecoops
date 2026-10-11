@@ -11,6 +11,7 @@ def build_investigation_context(incident, data_source=None):
     return {
         "incident": {
             "id": incident["incident_id"],
+            "hazard": incident.get("hazard", "heat"),
             "type": incident["type"],
             "severity": incident["severity"],
             "location": incident["location"]
@@ -19,6 +20,7 @@ def build_investigation_context(incident, data_source=None):
             "peak_temperature_c": incident["max_temp"],
             "peak_time": details.get("peak_time"),
             "lowest_temperature_c": details.get("min_temp"),
+            "lowest_time": details.get("min_time"),
             "valid_observations": incident["valid_observations"],
             "expected_observations": details.get("expected_observations"),
             "missing_observations": details.get("missing_observations"),
@@ -27,6 +29,12 @@ def build_investigation_context(incident, data_source=None):
         },
         "derived_metrics": {
             "average_temperature_c": incident["avg_temp"],
+            "hazard": incident.get("hazard", "heat"),
+            "streak_hours": incident["hot_streak_hours"],
+            "streak_start": details.get("longest_streak_start"),
+            "streak_end": details.get("longest_streak_end"),
+            "hours_beyond_threshold": details.get("hours_beyond_threshold"),
+            # legacy heat-named keys kept for existing consumers
             "hot_streak_hours": incident["hot_streak_hours"],
             "hot_streak_start": details.get("longest_streak_start"),
             "hot_streak_end": details.get("longest_streak_end"),
@@ -48,7 +56,7 @@ def build_investigator_prompt(context):
     """
 
     return f"""
-You are EcoOps Incident Investigator.
+You are EcoOps Incident Investigator. The deterministic detector is the source of truth: never contradict its hazard, severity or streak.
 
 Analyze ONLY the evidence supplied below.
 

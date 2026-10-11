@@ -2,11 +2,11 @@
 
 **Anticipate the risk. Investigate the evidence. Prepare the response.**
 
-EcoOps is a decision-support prototype for proactive environmental operations. Its primary mode screens the next seven days of **Delhi hourly temperature forecasts** from Open-Meteo for configurable sustained-heat risk windows. It can investigate the forecast evidence, propose preparation actions, and simulate whether assumed teams, budget and time are sufficient. A separate historical replay mode uses NASA POWER data for a repeatable demonstration.
+EcoOps is a decision-support prototype for proactive environmental operations. Its primary mode screens the next seven days of **Delhi hourly temperature forecasts** from Open-Meteo for configurable sustained **heat and cold** risk windows, with no manual hazard selector. It can investigate the forecast evidence, propose preparation actions, and simulate whether assumed teams, budget and time are sufficient. A separate historical replay mode uses NASA POWER data for a repeatable demonstration.
 
 ```
-Open-Meteo forecast -> projected risk window -> evidence-backed investigation
-                    -> preparation plan -> resource simulation -> compare allocations
+Open-Meteo forecast -> automatic heat + cold screening -> evidence-backed investigation (per risk)
+                    -> combined preparation plan -> resource simulation -> compare allocations
 
 NASA POWER historical replay -------------------------------------^ (demo fallback)
 ```
@@ -20,14 +20,14 @@ Forecasts are model predictions, not live sensor readings, certainties or offici
 | **Forecast** | Hourly forecast temperature, forecast peak and timing | Open-Meteo forecast API |
 | **Historical** | Hourly historical temperature, peak reading and its time | NASA POWER `T2M` |
 | **Derived** | Average, hours above trigger, longest hot streak, severity | Calculated from the observations by a stated rule |
-| **Assumed** | The 35 °C / 4 h / 8 h rules; team counts, budget units, durations of each action | Chosen for this demo. Not measured, not official |
+| **Assumed** | The 35 °C heat / 5 °C cold, 4 h / 8 h rules; team counts, budget units, durations of each action | Chosen for this demo. Not measured, not official |
 
 The UI tags every investigation line with one of these. EcoOps never fabricates readings, health outcomes, casualties
 prevented or temperature reductions. The simulation models **resource allocation only**.
 
 ## Primary workflow: forecast screening
 
-The UI opens in forecast mode and requests seven days of hourly temperature values from Open-Meteo for Delhi. EcoOps applies its explicitly configurable demonstration rule (4+ consecutive hours at or above 35 °C; HIGH at 8+ hours) to identify a **projected heat-risk window**. A forecast match is not an observed incident or an official heatwave classification. If no match is found, EcoOps says so rather than manufacturing a risk.
+The UI opens in forecast mode and requests seven days of hourly temperature values from Open-Meteo for Delhi. EcoOps applies its explicitly configurable demonstration rules to the same data for **both** hazards (heat: 4+ consecutive hours at or above 35 °C; cold: 4+ consecutive hours at or below 5 °C; HIGH at 8+ hours) to identify **projected heat-risk and/or cold-risk windows**. A forecast match is not an observed incident or an official heatwave classification. If no match is found, EcoOps says so rather than manufacturing a risk.
 
 Use **Historical replay** in the header to switch to the NASA POWER May 1–3, 2025 demonstration window. This fallback is useful when the forecast service is unavailable or when a repeatable heat-event demo is needed. Use the header refresh button to fetch the selected source again.
 
@@ -62,7 +62,10 @@ If you skip `fetch_demo_data.py`, the app tries NASA POWER on first use of histo
 ```powershell
 cd ecoops\backend
 python -m pytest
+node --check ..\frontend\app.js
 ```
+
+The suite uses synthetic series only. It covers detection rules (4 h / 8 h, gaps, malformed data), both modes, the combined plan and simulation, and Strands/Ollama fallback. Browser behaviour (chart, buttons) is checked manually with the demo checklist; the suite does not drive a browser.
 
 
 ### Optional AWS Strands agent (local Ollama model)
@@ -87,9 +90,9 @@ To return to the default deterministic mode, close the server or run `$env:ECOOP
 ## Demo path
 
 1. Open the command center. Forecast mode screens the next seven days and labels any trigger match as a projected risk, not an observed incident. The chart and data provenance show the forecast source and retrieval time.
-2. Hover the chart to read single hours. Shaded bands are the qualifying hot streaks; dashed lines mark missing hours.
-3. **Run investigation**: five deterministic checks, then Forecast (or Observed in replay) / Derived / Assumed / Recommended sections.
-4. **Generate response plan**: four recommended actions with explanation, resource needs and status.
+2. Hover the chart to read single hours. Both threshold lines (red heat, blue cold) are always drawn; shaded bands are qualifying heat/cold intervals; dashed vertical lines mark missing hours.
+3. **Run investigation**: one block per qualifying risk, each with five deterministic checks, a "why it qualified" line, then Forecast (or Observed in replay) / Derived / Assumed / Recommended sections.
+4. **Generate response plan**: heat actions (A1-A4) and/or cold actions (C1-C4), grouped per risk; the simulation covers all of them.
 5. In **Response simulation**, drag *Available teams*, *Budget* and *Response window*.
 6. Reorder or untick actions. Watch actions flip between **Executable** and **Blocked** (reason: `TEAMS`, `BUDGET` or `TIME`).
 7. Read the schedule lanes, the resource meters and the table comparing your allocation with the full plan.
@@ -98,20 +101,32 @@ To return to the default deterministic mode, close the server or run `$env:ECOOP
 Good scenarios to show: defaults (3 of 4 actions, water check blocked on budget); budget 170 (all four); window 5 h
 (water check blocked on time); teams 1 (water check blocked, needs two teams).
 
-## Detection rule (prototype settings)
+## Automatic heat and cold detection (prototype settings)
 
-- Trigger: at least **4 consecutive** valid hourly readings **at or above 35 °C**.
-- Severity: MEDIUM at 4+ consecutive hours, HIGH at 8+.
-- A missing hour (`-999`, non-numeric, or absent timestamp) is excluded from statistics **and breaks a streak**. The
-  prototype used to join hot stretches across gaps; that bug is fixed and covered by a test.
-- Historical replay window: Delhi (28.6139, 77.2090), 2025-05-01 to 2025-05-03. Forecast mode instead uses the current seven-day Open-Meteo forecast and displays its actual returned window.
-- These are EcoOps operational settings, not a meteorological heatwave definition. Metrics are recalculated from the
-  data on every request; none are hardcoded.
-- NASA POWER hourly data defaults to **Local Solar Time (LST)**, not Delhi clock time (IST). The UI labels timestamps
-  with the time standard reported by the response, or the documented default when the response does not say.
+Every load calls `GET /assess`, which screens the **same** hourly series for heat and for cold. There is no heat/cold
+selector; only the data mode (forecast / historical) is chosen. The overall status is one of:
 
-The earlier prototype recorded 72 valid observations, a peak near 38.8 °C and an 8-hour streak for this window. Compare
-that with what the app shows after you fetch the data. If they differ, trust the data and investigate the difference.
+| Status | Meaning |
+|---|---|
+| Heat risk detected | only the heat rule qualified |
+| Cold risk detected | only the cold rule qualified |
+| Both risks detected | both qualified; each keeps its own incident, investigation, plan and actions |
+| No qualifying temperature risk | data was assessed and neither rule qualified (a valid result) |
+| Assessment unavailable | no usable data; **not** the same as "no risk" and nothing was evaluated |
+
+- Heat: at least **4 consecutive** valid hourly readings **at or above 35 °C**. Cold: **at or below 5 °C**. HIGH at 8+ hours for each.
+- Streaks are independent per hazard. The result records the longest streak, every qualifying interval, the peak (heat) / lowest (cold) temperature and its timestamp.
+- A missing hour (`-999`, non-numeric, or absent timestamp) is excluded from statistics **and breaks a streak**.
+- Qualifying incidents are ordered by severity, then streak length. Incident ids are fixed per mode and hazard, so repeating a request never creates duplicates.
+- Historical replay window: Delhi (28.6139, 77.2090), 2025-05-01 to 2025-05-03. Forecast mode uses the current seven-day Open-Meteo forecast and displays its actual returned window. Historical mode never invents hourly data the source did not provide.
+- These are EcoOps demo settings, **not** official IMD criteria, medical guidance or a meteorological definition. A qualified authority must validate any real thresholds.
+- NASA POWER hourly data defaults to **Local Solar Time (LST)**, not Delhi clock time (IST). The UI labels timestamps with the time standard reported by the response, or the documented default.
+
+### Configuring the rules
+
+Defined once in `backend/config.py`. Optional environment variables override them (invalid values fall back to defaults):
+`ECOOPS_HEAT_THRESHOLD_C` (35), `ECOOPS_COLD_THRESHOLD_C` (5), `ECOOPS_MIN_STREAK_HOURS` (4), `ECOOPS_HIGH_STREAK_HOURS` (8).
+Other variables: `ECOOPS_DATA_FILE`, `ECOOPS_INVESTIGATOR` (`deterministic` or `strands_ollama`), `ECOOPS_OLLAMA_MODEL`, `ECOOPS_OLLAMA_HOST`.
 
 ## Simulation model
 
@@ -131,14 +146,15 @@ assumptions in the UI.
 |---|---|
 | `GET /` | Redirects to the UI |
 | `GET /health` | Liveness check |
-| `GET /detect?mode=forecast` | Projected risk screening from hourly Open-Meteo forecasts (default in UI) |
+| `GET /assess?mode=forecast` | **Used by the UI.** Heat and cold assessments, overall status, ranked incident ids, provenance |
+| `GET /detect?mode=forecast&hazard=heat\|cold` | One hazard's incident (kept for compatibility; defaults to heat) |
 | `GET /detect?mode=historical` | Historical NASA POWER replay; `?refresh=true` re-fetches NASA POWER |
-| `GET /response?mode=forecast` | Preparation plan when forecast values meet the trigger |
-| `GET /investigate?mode=forecast` | Forecast evidence package and investigation |
+| `GET /response?mode=forecast&hazard=all` | Combined plan for every qualifying risk (`heat`, `cold` or `all`) |
+| `GET /investigate?mode=forecast&hazard=heat\|cold` | Evidence package and investigation for one risk |
 | `GET /simulate?mode=forecast` | Simulation with default resources |
-| `POST /simulate?mode=forecast` | `{"teams": 2, "budget": 120, "window_hours": 6, "action_order": ["A1","A2"]}` |
+| `POST /simulate?mode=forecast&hazard=all` | `{"teams": 2, "budget": 120, "window_hours": 6, "action_order": ["A1","A2"]}` |
 
-Invalid input (negative teams, unknown action id, and so on) returns `422`. Simulating without an incident returns `409`.
+Invalid input (negative teams, unknown action id, bad `mode`/`hazard`) returns `422`. Simulating with no qualifying risk, or with the assessment unavailable, returns `409` with different messages.
 Interactive docs: <http://127.0.0.1:8000/docs>.
 
 ## Architecture
@@ -152,10 +168,10 @@ backend/
     forecast.py                Open-Meteo forecast retrieval, caching, provenance
     nasa_power.py              NASA POWER historical retrieval, saved copy, provenance
     incident_engine.py         detection (gap-aware streaks)
-    incident_service.py        builds the incident once per request from cached data
+    incident_service.py        screens heat AND cold from one data load; ranks incidents; overall status
     investigation.py           evidence package + prompt for a future LLM investigator
-    investigator.py            Investigator interface + DeterministicInvestigator
-    response_engine.py         action catalog and plan
+    investigator.py            Investigator interface; hazard-aware DeterministicInvestigator; optional Strands/Ollama
+    response_engine.py         heat (A1-A4) and cold (C1-C4) action catalogs, per-risk and combined plan
     simulation.py              allocation simulator and baseline comparison
   tests/                       automated backend tests
 frontend/                      plain HTML, CSS, JavaScript (no framework, no external requests)
@@ -184,7 +200,7 @@ data/demo_incident.json        created by the fetch step (real NASA POWER respon
 
 ## Implementation status
 
-EcoOps is a local decision-support prototype that combines weather data, rule-based heat-risk screening, evidence-based investigation, response planning, and resource-allocation simulation.
+EcoOps is a local decision-support prototype that combines weather data, rule-based automatic heat and cold risk screening, evidence-based investigation, response planning, and resource-allocation simulation.
 
 - **Forecast screening:** Retrieves hourly Delhi temperature forecasts from Open-Meteo and evaluates them against configurable demonstration thresholds.
 - **Historical replay:** Uses NASA POWER data for a repeatable historical demonstration.
@@ -197,7 +213,7 @@ EcoOps is a local decision-support prototype that combines weather data, rule-ba
 
 EcoOps is a prototype for decision support, not an official warning system. Forecasts are model predictions and may change. The demonstration thresholds and resource costs are assumptions, not official standards or measured operational costs.
 
-The simulation evaluates resource allocation; it does not predict health outcomes, casualties prevented, or temperature reductions. Recommendations require human review before real-world use.
+The simulation evaluates resource allocation; it does not predict health outcomes, casualties prevented, or temperature reductions. Recommendations require human review before real-world use. Humidity, wind chill, exposure and local facilities are not modelled. EcoOps is not production-ready.
 
 ## Running the project
 

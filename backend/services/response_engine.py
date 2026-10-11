@@ -60,17 +60,34 @@ COLD_ACTIONS = [
 ]
 
 
-def generate_response_plan(incident):
-    """Generate a hazard-specific planning response from a detected incident."""
+_EVENT_TYPES = {
+    "heat": {"HEAT_EVENT", "FORECAST_HEAT_RISK"},
+    "cold": {"COLD_EVENT", "FORECAST_COLD_RISK"},
+}
+_TEMPLATES = {"heat": HEAT_ACTIONS, "cold": COLD_ACTIONS}
+
+
+def _hazard_of(incident):
     incident_type = incident.get("type")
-    hazard = incident.get("hazard") or incident.get("details", {}).get(
+    return incident.get("hazard") or incident.get("details", {}).get(
         "hazard", "cold" if "COLD" in str(incident_type) else "heat"
     )
-    event_types = (
-        {"HEAT_EVENT", "FORECAST_HEAT_RISK"} if hazard == "heat"
-        else {"COLD_EVENT", "FORECAST_COLD_RISK"}
-    )
-    if incident_type not in event_types:
+
+
+def generate_response_plan(incident):
+    """Generate a hazard-specific planning response for ONE detected incident."""
+    incident_type = incident.get("type")
+    hazard = _hazard_of(incident)
+
+    if incident_type == "DATA_UNAVAILABLE":
+        # Distinct from "no risk": the data could not be assessed at all.
+        return {
+            "incident_id": incident["incident_id"],
+            "status": "ASSESSMENT_UNAVAILABLE",
+            "hazard": hazard,
+            "actions": [],
+        }
+    if incident_type not in _EVENT_TYPES.get(hazard, set()):
         return {
             "incident_id": incident["incident_id"],
             "status": "NO_RESPONSE_REQUIRED",
@@ -78,15 +95,17 @@ def generate_response_plan(incident):
             "actions": [],
         }
 
-    templates = HEAT_ACTIONS if hazard == "heat" else COLD_ACTIONS
     actions = []
-    for priority, template in enumerate(templates, start=1):
+    for priority, template in enumerate(_TEMPLATES[hazard], start=1):
         action = dict(template)
         action["priority"] = priority
         action["status"] = "RECOMMENDED"
         action["kind"] = "recommendation"
+        action["hazard"] = hazard
+        action["incident_id"] = incident["incident_id"]
         actions.append(action)
 
+    streak = incident.get("streak_hours", incident.get("hot_streak_hours", 0))
     forecast = str(incident_type).startswith("FORECAST_")
     return {
         "incident_id": incident["incident_id"],
@@ -94,11 +113,46 @@ def generate_response_plan(incident):
         "hazard": hazard,
         "trigger": {
             "type": incident_type,
+            "hazard": hazard,
             "basis": "forecast" if forecast else "historical observation",
             "severity": incident["severity"],
-            "hot_streak_hours": incident.get("hot_streak_hours", 0),
+            "streak_hours": streak,
+            "hot_streak_hours": streak,  # legacy field name
             "threshold": incident.get("threshold"),
         },
+        "disclaimer": DISCLAIMER,
+        "assumption_note": ASSUMPTION_NOTE,
+        "actions": actions,
+    }
+
+
+def generate_combined_plan(incidents, unavailable=False):
+    """Merge per-hazard plans so no qualifying incident's actions are lost.
+
+    `incidents` should be ordered most-severe first (see rank_incidents);
+    action ids (A1-A4 heat, C1-C4 cold) are unique, and priorities are
+    renumbered across the merged list in that order.
+    """
+    plans = [generate_response_plan(i) for i in incidents]
+    plans = [p for p in plans if p["status"] == "RESPONSE_RECOMMENDED"]
+    if not plans:
+        return {
+            "incident_id": None, "incident_ids": [], "hazards": [], "plans": [],
+            "status": "ASSESSMENT_UNAVAILABLE" if unavailable else "NO_RESPONSE_REQUIRED",
+            "actions": [],
+        }
+    actions = []
+    for plan in plans:
+        for action in plan["actions"]:
+            merged = dict(action)
+            merged["priority"] = len(actions) + 1
+            actions.append(merged)
+    return {
+        "incident_id": "+".join(p["incident_id"] for p in plans),
+        "incident_ids": [p["incident_id"] for p in plans],
+        "hazards": [p["hazard"] for p in plans],
+        "status": "RESPONSE_RECOMMENDED",
+        "plans": plans,
         "disclaimer": DISCLAIMER,
         "assumption_note": ASSUMPTION_NOTE,
         "actions": actions,

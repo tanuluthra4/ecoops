@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,10 +7,10 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from config import FRONTEND_DIR
-from services.incident_service import build_incident
+from services.incident_service import build_assessment, build_incident, rank_incidents
 from services.investigation import build_investigation_context
 from services.investigator import get_investigator
-from services.response_engine import generate_response_plan
+from services.response_engine import generate_combined_plan, generate_response_plan
 from services.simulation import (
     DEFAULT_WINDOW_HOURS,
     SimulationInputError,
@@ -44,26 +44,43 @@ def health():
     return {"message": "EcoOps API Running"}
 
 
+Mode = Literal["forecast", "historical"]
+Hazard = Literal["heat", "cold"]
+HazardOrAll = Literal["heat", "cold", "all"]
+
+
+@app.get("/assess")
+def assess(refresh: bool = False, mode: Mode = "historical"):
+    """Automatic screening: heat AND cold from the same data, never just one."""
+    return build_assessment(refresh=refresh, mode=mode)
+
+
 @app.get("/detect")
-def detect(refresh: bool = False, mode: str = "historical", hazard: str = "heat"):
-    if hazard not in {"heat", "cold"}:
-        raise HTTPException(status_code=422, detail="hazard must be 'heat' or 'cold'")
+def detect(refresh: bool = False, mode: Mode = "historical", hazard: Hazard = "heat"):
     incident, data_source = build_incident(refresh=refresh, mode=mode, hazard=hazard)
     return {**incident, "data_source": data_source}
 
 
-@app.get("/response")
-def response(mode: str = "historical", hazard: str = "heat"):
-    if hazard not in {"heat", "cold"}:
-        raise HTTPException(status_code=422, detail="hazard must be 'heat' or 'cold'")
+def _plan_for(mode, hazard):
+    """Return (plan, assessment_status). hazard=all merges every qualifying risk."""
+    if hazard == "all":
+        assessment = build_assessment(mode=mode)
+        incidents = rank_incidents(assessment["assessments"].values())
+        return (
+            generate_combined_plan(incidents, unavailable=assessment["status"] == "UNAVAILABLE"),
+            assessment["status"],
+        )
     incident, _ = build_incident(mode=mode, hazard=hazard)
-    return generate_response_plan(incident)
+    return generate_response_plan(incident), None
+
+
+@app.get("/response")
+def response(mode: Mode = "historical", hazard: HazardOrAll = "heat"):
+    return _plan_for(mode, hazard)[0]
 
 
 @app.get("/investigate")
-def investigate(mode: str = "historical", hazard: str = "heat"):
-    if hazard not in {"heat", "cold"}:
-        raise HTTPException(status_code=422, detail="hazard must be 'heat' or 'cold'")
+def investigate(mode: Mode = "historical", hazard: Hazard = "heat"):
     incident, data_source = build_incident(mode=mode, hazard=hazard)
     context = build_investigation_context(incident, data_source)
     investigation = get_investigator().investigate(context)
@@ -71,15 +88,17 @@ def investigate(mode: str = "historical", hazard: str = "heat"):
 
 
 def _run_simulation(request: SimulationRequest, mode="historical", hazard="heat"):
-    if hazard not in {"heat", "cold"}:
-        raise HTTPException(status_code=422, detail="hazard must be 'heat' or 'cold'")
-    incident, _ = build_incident(mode=mode, hazard=hazard)
-    plan = generate_response_plan(incident)
+    plan, _ = _plan_for(mode, hazard)
 
     if plan["status"] != "RESPONSE_RECOMMENDED":
+        unavailable = plan["status"] == "ASSESSMENT_UNAVAILABLE"
         raise HTTPException(
             status_code=409,
-            detail="No response plan exists because the selected data window did not meet the configured risk trigger.",
+            detail=(
+                "No response plan exists because the temperature data could not be assessed."
+                if unavailable else
+                "No response plan exists because the selected data window did not meet the configured risk trigger."
+            ),
         )
 
     try:
@@ -87,16 +106,16 @@ def _run_simulation(request: SimulationRequest, mode="historical", hazard="heat"
     except SimulationInputError as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
-    return {"incident_id": incident["incident_id"], **result}
+    return {"incident_id": plan["incident_id"], "incident_ids": plan.get("incident_ids", [plan["incident_id"]]), **result}
 
 
 @app.get("/simulate")
-def simulate_default(mode: str = "historical", hazard: str = "heat"):
+def simulate_default(mode: Mode = "historical", hazard: HazardOrAll = "heat"):
     return _run_simulation(SimulationRequest(), mode=mode, hazard=hazard)
 
 
 @app.post("/simulate")
-def simulate(request: SimulationRequest, mode: str = "historical", hazard: str = "heat"):
+def simulate(request: SimulationRequest, mode: Mode = "historical", hazard: HazardOrAll = "heat"):
     return _run_simulation(request, mode=mode, hazard=hazard)
 
 

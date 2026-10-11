@@ -2,17 +2,25 @@
 
 /* EcoOps frontend: plain JavaScript, no framework, no external requests.
    Served by the backend at /ui/. If opened straight from disk (file://) it
-   talks to the backend on http://127.0.0.1:8000 instead. */
+   talks to the backend on http://127.0.0.1:8000 instead.
+
+   Heat AND cold are always screened together (GET /assess). There is no
+   manual hazard selector; only the data mode (forecast / historical) is chosen. */
 
 const API_BASE = location.protocol === "file:" ? "http://127.0.0.1:8000" : "";
 const DEFAULT_CONTROLS = { teams: 2, budget: 120, window: 6 };
 const MAX_PINNED = 4;
 
+const HAZ = {
+    heat: { name: "Heat", color: "#ff5b3a", soft: "rgba(255,91,58,0.13)", rel: "at or above", sym: "≥", dash: "6 5", extreme: "Peak", noun: "hot" },
+    cold: { name: "Cold", color: "#60a5fa", soft: "rgba(96,165,250,0.15)", rel: "at or below", sym: "≤", dash: "2 4", extreme: "Lowest", noun: "cold" },
+};
+const HAZARDS = ["heat", "cold"];
+
 const state = {
     mode: "forecast",
-    hazard: "heat",
-    assessment: null,
-    incident: null,
+    assessment: null,   // full /assess payload
+    incidents: [],      // qualifying incidents, most severe first
     source: null,
     plan: null,
     order: [],
@@ -45,9 +53,13 @@ const fmtTime = (t) => (t ? String(t).replace("T", " ") : "n/a");
 const fmtDate8 = (s) =>
     s && String(s).length === 8 ? `${s.slice(0, 4)}-${s.slice(4, 6)}-${s.slice(6, 8)}` : s || "n/a";
 
-function modePath(path) {
+const isRisk = (inc) => !!inc && inc.status === "RISK_DETECTED";
+const hazardOf = (inc) => (inc && inc.hazard === "cold" ? "cold" : "heat");
+
+function modePath(path, hazard) {
     const joiner = path.includes("?") ? "&" : "?";
-    return `${path}${joiner}mode=${encodeURIComponent(state.mode)}&hazard=${encodeURIComponent(state.hazard)}`;
+    const base = `${path}${joiner}mode=${encodeURIComponent(state.mode)}`;
+    return hazard ? `${base}&hazard=${encodeURIComponent(hazard)}` : base;
 }
 
 function updateModeControls() {
@@ -69,18 +81,24 @@ async function api(path, options = {}) {
             headers: { "Content-Type": "application/json", ...(options.headers || {}) },
         });
         let body = null;
+        let malformed = false;
         try {
             body = await res.json();
-        } catch (_) { /* non-JSON error body */ }
+        } catch (_) { malformed = true; }
 
         if (!res.ok) {
             let detail = res.statusText;
             if (body && body.detail) {
                 detail = typeof body.detail === "string"
                     ? body.detail
-                    : body.detail.map((d) => `${(d.loc || []).slice(1).join(".")}: ${d.msg}`).join("; ");
+                    : Array.isArray(body.detail)
+                        ? body.detail.map((d) => `${(d.loc || []).slice(1).join(".")}: ${d.msg}`).join("; ")
+                        : JSON.stringify(body.detail);
             }
             throw new Error(`${res.status} ${detail}`);
+        }
+        if (malformed || body === null || typeof body !== "object") {
+            throw new Error("The backend returned a response EcoOps could not read (malformed JSON).");
         }
         return body;
     } catch (err) {
@@ -116,6 +134,10 @@ function setBanners(html) {
 
 /* ---------- incident ---------- */
 
+function overallStatus() {
+    return state.assessment ? state.assessment.status : null;
+}
+
 function resetDownstream() {
     state.plan = null;
     state.order = [];
@@ -128,26 +150,35 @@ function resetDownstream() {
     clearTimeout(state.simTimer);
     state.simSeq += 1;
 
-    const usable = state.incident && state.incident.type !== "DATA_UNAVAILABLE";
+    const status = overallStatus();
+    const hasRisk = state.incidents.length > 0;
+    const why = status === "UNAVAILABLE"
+        ? "The temperature data could not be assessed, so there is nothing to investigate yet. Fix the data source and try again."
+        : status === "NEITHER"
+            ? "No qualifying heat or cold risk was found in this data, so there is nothing to investigate. This is a valid result, not missing data."
+            : null;
 
-    $("investigate-root").innerHTML = `
+    $("investigate-root").innerHTML = hasRisk ? `
         <div class="empty">
-            <p>Run the investigation to see what the data shows, how each number was derived,
-            and which assumptions apply.</p>
-            <button class="btn primary" data-action="investigate" ${usable ? "" : "disabled"}>Run investigation</button>
-        </div>`;
+            <p>Run the investigation to see, for each qualifying risk, what the data shows, how each number was
+            derived, and which assumptions apply.</p>
+            <button class="btn primary" data-action="investigate">Run investigation</button>
+        </div>` : `<div class="empty"><p>${esc(why || "Load an assessment first.")}</p></div>`;
 
-    $("plan-root").innerHTML = `
+    $("plan-root").innerHTML = hasRisk ? `
         <div class="empty">
-            <p>Generate a recommended response plan from the detected incident. Recommendations only; EcoOps does
-            not contact anyone or dispatch teams.</p>
-            <button class="btn primary" data-action="plan" ${usable ? "" : "disabled"}>Generate response plan</button>
-        </div>`;
+            <p>Generate a recommended response plan covering every qualifying risk. Recommendations only; EcoOps
+            does not contact anyone or dispatch teams.</p>
+            <button class="btn primary" data-action="plan">Generate response plan</button>
+        </div>` : `<div class="empty"><p>${esc(status === "UNAVAILABLE"
+            ? "No plan can be made because the assessment is unavailable."
+            : status === "NEITHER" ? "No response plan is needed: no qualifying temperature risk." : "Load an assessment first.")}</p></div>`;
 
     $("simulate-root").innerHTML = `
         <div class="empty">
-            <p>Generate the response plan first. Then you can change teams, budget and time, reorder actions, and see
-            which become executable or blocked.</p>
+            <p>${hasRisk
+            ? "Generate the response plan first. Then you can change teams, budget and time, reorder actions, and see which become executable or blocked."
+            : "There is no response plan to simulate."}</p>
         </div>`;
 }
 
@@ -161,129 +192,158 @@ async function loadIncident(refresh = false) {
     setBanners("");
 
     try {
-        // Assess heat and cold in parallel. The UI selects the active risk
-        // automatically; the user never has to choose a hazard manually.
-        const suffix = refresh ? "?refresh=true" : "";
-        const modeOnlyPath = (hazard) => `/detect${suffix}${suffix ? "&" : "?"}mode=${encodeURIComponent(state.mode)}&hazard=${hazard}`;
-        const [heat, cold] = await Promise.all([
-            api(modeOnlyPath("heat")),
-            api(modeOnlyPath("cold")),
-        ]);
-        state.assessment = { heat, cold };
-        const triggered = (x) => ["HEAT_EVENT", "FORECAST_HEAT_RISK", "COLD_EVENT", "FORECAST_COLD_RISK"].includes(x.type);
-        const rank = (x) => x.severity === "HIGH" ? 2 : x.severity === "MEDIUM" ? 1 : 0;
-        const candidates = [heat, cold].filter(triggered).sort((a, b) =>
-            rank(b) - rank(a) || (b.hot_streak_hours || 0) - (a.hot_streak_hours || 0));
-        let chosen;
-        if (candidates.length) {
-            chosen = candidates[0];
-        } else {
-            // With no trigger, focus the chart on the rule with the longer
-            // near-threshold streak while still displaying both rules.
-            chosen = (cold.hot_streak_hours || 0) > (heat.hot_streak_hours || 0) ? cold : heat;
+        const data = await api(modePath(`/assess${refresh ? "?refresh=true" : ""}`));
+        const a = data.assessments;
+        if (!a || !a.heat || !a.cold || !data.status || !data.data_source) {
+            throw new Error("The backend returned an incomplete assessment (heat/cold results missing).");
         }
-        state.hazard = chosen.hazard || (chosen.type.includes("COLD") ? "cold" : "heat");
-        state.incident = chosen;
-        state.source = chosen.data_source;
+        state.assessment = data;
+        state.source = data.data_source;
+        state.incidents = (data.incident_ids || [])
+            .map((id) => HAZARDS.map((h) => a[h]).find((x) => x.incident_id === id))
+            .filter(Boolean);
         resetDownstream();
         renderIncident();
     } catch (err) {
-        state.incident = null;
+        state.assessment = null;
+        state.incidents = [];
         state.source = null;
         resetDownstream();
-        $("incident-root").innerHTML = errorBlock("Could not load the incident", err.message, "retry");
+        $("evidence-root").innerHTML = "";
+        $("incident-root").innerHTML = errorBlock("Could not load the assessment", err.message, "retry");
     }
 }
 
+const STATUS_CLASS = {
+    HEAT_ONLY: "heat", COLD_ONLY: "cold", BOTH: "both", NEITHER: "none", UNAVAILABLE: "unavailable",
+};
+
+function riskCard(hazard) {
+    const inc = state.assessment.assessments[hazard];
+    const hz = HAZ[hazard];
+    const d = inc.details || {};
+    const rules = d.rules || {};
+    const ts = state.source.time_standard;
+    const isForecast = state.mode === "forecast";
+    const rule = `${hz.sym} ${num(inc.threshold)} °C for ${esc(rules.min_streak_hours)}+ consecutive hours (HIGH at ${esc(rules.high_streak_hours)} h)`;
+
+    let chip;
+    let body;
+    if (inc.status === "UNAVAILABLE") {
+        chip = `<span class="badge st-unavailable">Could not assess</span>`;
+        body = `<p class="fine">No valid hourly temperatures were available, so ${hz.name.toLowerCase()} risk was <strong>not evaluated</strong>. This is not a "no risk" result.</p>`;
+    } else {
+        chip = isRisk(inc)
+            ? `<span class="badge sev-${esc(inc.severity)}">${isForecast ? "Forecast " : ""}${hz.name.toLowerCase()} risk &middot; ${esc(inc.severity)}</span>`
+            : `<span class="badge st-none">No qualifying ${hz.name.toLowerCase()} risk</span>`;
+        const extremeVal = hazard === "cold" ? d.min_temp : inc.max_temp;
+        const extremeTime = hazard === "cold" ? d.min_time : d.peak_time;
+        const intervals = (d.qualifying_streaks || []);
+        body = `
+            <div class="mini-stats">
+                <div><span class="label">${hz.extreme} temperature</span>
+                    <span class="value">${num(extremeVal)}<small> &deg;C</small></span>
+                    <span class="sub">${esc(fmtTime(extremeTime))} ${esc(ts)}</span></div>
+                <div><span class="label">Longest ${hz.noun} run</span>
+                    <span class="value">${esc(inc.streak_hours)}<small> h</small></span>
+                    <span class="sub">${d.longest_streak_start ? `${esc(fmtTime(d.longest_streak_start))} to ${esc(fmtTime(d.longest_streak_end))}` : `no hour ${hz.rel} ${num(inc.threshold)} °C`}</span></div>
+                <div><span class="label">Hours ${hz.rel} trigger</span>
+                    <span class="value">${esc(d.hours_beyond_threshold ?? 0)}<small> h</small></span>
+                    <span class="sub">of ${esc(inc.valid_observations)} valid hours</span></div>
+            </div>
+            ${isRisk(inc) && intervals.length ? `<p class="fine"><strong>Qualifying ${intervals.length > 1 ? "intervals" : "interval"}:</strong> ${intervals.map((s) =>
+                `${esc(fmtTime(s.start))} to ${esc(fmtTime(s.end))} (${esc(s.hours)} h)`).join("; ")}</p>` : ""}
+            ${!isRisk(inc) ? `<p class="fine">Valid assessment: the longest run ${hz.rel} the trigger was shorter than the ${esc(rules.min_streak_hours)} h minimum.</p>` : ""}`;
+    }
+
+    return `
+        <article class="risk-card hz-${hazard} ${isRisk(inc) ? "active" : ""}" aria-label="${hz.name} risk assessment">
+            <div class="risk-head"><h3><span class="swatch" style="background:${hz.color}"></span>${hz.name} risk</h3>${chip}</div>
+            <p class="rule-line">Rule: ${rule}</p>
+            ${body}
+            <p class="fine id-line">${esc(inc.incident_id)}</p>
+        </article>`;
+}
+
 function renderIncident() {
-    const inc = state.incident;
+    const a = state.assessment;
     const src = state.source;
-    const d = inc.details;
     const root = $("incident-root");
+    const isForecast = state.mode === "forecast";
+    const status = a.status;
+    const heat = a.assessments.heat;
+    const cold = a.assessments.cold;
+    const heatD = heat.details || {};
 
     if (src && src.synthetic) {
         setBanners(`<div class="banner danger"><strong>Synthetic test data.</strong>
             These values are not NASA observations. Do not present them as real.</div>`);
     }
 
-    if (inc.type === "DATA_UNAVAILABLE") {
-        $("evidence-root").innerHTML = "";
-        root.innerHTML = `
-            <div class="error-block" role="alert">
-                <h3>${state.mode === "forecast" ? "Forecast unavailable" : "No historical temperature data available"}</h3>
-                <p>${esc(src && src.note ? src.note : "NASA POWER returned no valid temperature observations.")}</p>
-                ${state.mode === "forecast"
-                    ? `<p>EcoOps never substitutes invented forecast values. You can retry the forecast or switch to the historical replay to demonstrate the complete workflow.</p>`
-                    : `<p>EcoOps never substitutes invented data. To prepare the offline historical demonstration dataset, run this once while connected to the internet:</p><p><code>python scripts/fetch_demo_data.py</code></p>`}
-                <button class="btn" data-action="refresh">${state.mode === "forecast" ? "Retry forecast" : "Try NASA POWER again"}</button>
-            </div>`;
+    const rules = heatD.rules || {};
+    const unavailable = status === "UNAVAILABLE";
+
+    root.innerHTML = `
+        <div class="incident-head">
+            <div>
+                <div class="eyebrow" id="h-incident">${esc(heat.location)} &middot; ${isForecast ? "7-day forecast risk screening" : "historical demonstration replay"}</div>
+                <h1>${esc(a.status_label)}</h1>
+                ${isForecast ? `<p class="rule">Forecast screening, not an observed incident or official warning. Forecasts can change; confirm with local authorities and current conditions.</p>` : `<p class="rule">Historical replay of saved NASA POWER data, not a live incident.</p>`}
+                <p class="rule">Heat and cold are always checked together: heat at or above ${esc(num(heat.threshold))} &deg;C and cold at or below ${esc(num(cold.threshold))} &deg;C, each for ${esc(rules.min_streak_hours ?? 4)} consecutive hourly readings (MEDIUM), HIGH from ${esc(rules.high_streak_hours ?? 8)} h. These are EcoOps demo settings, not official IMD or medical thresholds.</p>
+            </div>
+            <div class="badges">
+                <span class="badge status-${STATUS_CLASS[status] || "none"}" id="overall-status">${esc(a.status_label)}</span>
+            </div>
+        </div>
+
+        ${unavailable ? `
+        <div class="error-block" role="alert">
+            <h3>${isForecast ? "Forecast unavailable" : "No historical temperature data available"}</h3>
+            <p>${esc(src && src.note ? src.note : "No valid temperature observations were returned.")}</p>
+            ${isForecast
+                ? `<p>EcoOps never substitutes invented forecast values. Retry the forecast or switch to the historical replay.</p>`
+                : `<p>EcoOps never substitutes invented data. To prepare the offline demonstration dataset, run this once while connected to the internet:</p><p><code>python scripts/fetch_demo_data.py</code></p>`}
+            <button class="btn" data-action="refresh">${isForecast ? "Retry forecast" : "Try NASA POWER again"}</button>
+        </div>` : ""}
+
+        <div class="risk-grid">${riskCard("heat")}${riskCard("cold")}</div>
+
+        ${unavailable ? "" : `
+        <div class="stats stats-3">
+            <div class="stat">
+                <div class="label">${isForecast ? "Forecast mean temperature" : "Average temperature"}</div>
+                <div class="value">${num(heat.avg_temp)}<small> &deg;C</small></div>
+                <div class="sub">mean of valid readings</div>
+            </div>
+            <div class="stat">
+                <div class="label">${isForecast ? "Forecast hours available" : "Valid observations"}</div>
+                <div class="value">${esc(heat.valid_observations)}<small> / ${esc(heatD.expected_observations)}</small></div>
+                <div class="sub">${esc(heatD.missing_observations)} missing</div>
+            </div>
+            <div class="stat">
+                <div class="label">Temperature range</div>
+                <div class="value">${num(cold.details.min_temp)}<small> to </small>${num(heat.max_temp)}<small> &deg;C</small></div>
+                <div class="sub">lowest to highest valid hour</div>
+            </div>
+        </div>`}`;
+
+    if (unavailable) {
+        $("evidence-root").innerHTML = `<div class="empty"><p>There is no hourly series to plot because no valid temperature data was available.</p></div>`;
         return;
     }
 
     state.stage.detected = true;
     updatePipeline();
-
-    const isForecast = state.mode === "forecast";
-    const isCold = state.hazard === "cold";
-    const isEvent = isCold
-        ? inc.type === "COLD_EVENT" || inc.type === "FORECAST_COLD_RISK"
-        : inc.type === "HEAT_EVENT" || inc.type === "FORECAST_HEAT_RISK";
-    const rules = d.rules;
-    const ts = src.time_standard;
-    const thresholdPhrase = isCold ? "at or below" : "at or above";
-    const hazardName = isCold ? "cold" : "heat";
-    const streakName = isCold ? "cold streak" : "hot streak";
-
-    root.innerHTML = `
-        <div class="incident-head">
-            <div>
-                <div class="eyebrow" id="h-incident">${esc(inc.incident_id)} &middot; ${esc(inc.location)} &middot; ${isForecast ? "7-day forecast risk screening" : "historical demonstration replay"}</div>
-                <h1>${isForecast
-                    ? (isEvent ? `Upcoming ${hazardName} risk identified` : `No qualifying heat or cold risk in forecast`)
-                    : (isEvent ? `Sustained ${hazardName} event detected` : `No sustained heat or cold event in this window`)}</h1>
-                ${isForecast ? `<p class="rule">This is a forecast-based screening signal, not an observed incident or official warning. Forecasts can change; confirm with local authorities and current conditions.</p>` : ""}
-                <p class="rule">Automatic screening checks both rules: heat at or above ${esc(state.assessment?.heat?.threshold)} &deg;C and cold at or below ${esc(state.assessment?.cold?.threshold)} &deg;C, each for ${esc(rules.min_streak_hours)} consecutive hours (MEDIUM); HIGH from ${esc(rules.high_streak_hours)} h. These are EcoOps demo settings, not official warnings.</p>
-            </div>
-            <div class="badges">
-                <span class="badge sev-${esc(inc.severity)}">Severity ${esc(inc.severity)}</span>
-                <span class="badge">${isForecast ? (isEvent ? `Forecast ${hazardName} risk` : `No heat/cold trigger`) : (isEvent ? `${hazardName} event` : `No heat/cold event`)}</span>
-            </div>
-        </div>
-
-        <div class="stats">
-            <div class="stat ${isEvent ? "hot" : ""}">
-                <div class="label">${isCold ? "Lowest temperature" : (isForecast ? "Forecast peak temperature" : "Peak temperature")}</div>
-                <div class="value">${num(isCold ? d.min_temp : inc.max_temp)}<small> &deg;C</small></div>
-                <div class="sub">at ${esc(fmtTime(isCold ? d.min_time : d.peak_time))} ${esc(ts)}</div>
-            </div>
-            <div class="stat">
-                <div class="label">${isForecast ? "Forecast mean temperature" : "Average temperature"}</div>
-                <div class="value">${num(inc.avg_temp)}<small> &deg;C</small></div>
-                <div class="sub">mean of valid readings</div>
-            </div>
-            <div class="stat ${isEvent ? "hot" : ""}">
-                <div class="label">${isForecast ? `Longest forecast ${streakName}` : `Longest ${streakName}`}</div>
-                <div class="value">${esc(inc.hot_streak_hours)}<small> h</small></div>
-                <div class="sub">${d.longest_streak_start
-            ? `${esc(fmtTime(d.longest_streak_start))} to ${esc(fmtTime(d.longest_streak_end))}`
-            : `no hour ${thresholdPhrase} ${esc(inc.threshold)} &deg;C`}</div>
-            </div>
-            <div class="stat">
-                <div class="label">${isForecast ? "Forecast hours available" : "Valid observations"}</div>
-                <div class="value">${esc(inc.valid_observations)}<small> / ${esc(d.expected_observations)}</small></div>
-                <div class="sub">${esc(d.missing_observations)} missing</div>
-            </div>
-        </div>`;
-
     renderEvidence();
 }
 
 /* ---------- evidence chart ---------- */
 
 function renderEvidence() {
-    const inc = state.incident;
+    const a = state.assessment;
     const src = state.source;
-    const d = inc.details;
+    const heat = a.assessments.heat;
+    const d = heat.details;
 
     const kindLabel = {
         saved_copy: "Saved copy of an earlier NASA POWER response",
@@ -291,6 +351,8 @@ function renderEvidence() {
         forecast: "Forecast model output retrieved this session",
     }[src.kind] || src.kind;
     const isForecast = state.mode === "forecast";
+    const loc = src.location || {};
+    const win = src.window || {};
 
     $("evidence-root").innerHTML = `
         <div class="evidence-grid">
@@ -305,11 +367,12 @@ function renderEvidence() {
                 <div class="readout" id="readout" aria-live="polite">Hover or touch the chart to read an hour.</div>
                 <div class="legend">
                     <span style="--c:#cfd6df">${isForecast ? "Forecast temperature" : "Observed / historical temperature"}</span>
-                    <span style="--c:#ff5b3a">Heat threshold reached</span>
-                    <span style="--c:#60a5fa">Cold threshold reached</span>
-                    <span class="shade">Qualifying ${state.hazard} streak</span>
-                    <span class="dash">Heat ${esc(state.assessment?.heat?.threshold ?? 35)} &deg;C</span>
-                    <span class="dash">Cold ${esc(state.assessment?.cold?.threshold ?? 5)} &deg;C</span>
+                    <span style="--c:${HAZ.heat.color}">Heat: hours at or above ${esc(num(heat.threshold))} &deg;C</span>
+                    <span style="--c:${HAZ.cold.color}">Cold: hours at or below ${esc(num(a.assessments.cold.threshold))} &deg;C</span>
+                    <span class="shade heat-shade">Qualifying heat interval</span>
+                    <span class="shade cold-shade">Qualifying cold interval</span>
+                    <span class="dash" style="--c:${HAZ.heat.color}">Heat threshold ${esc(num(heat.threshold))} &deg;C</span>
+                    <span class="dash" style="--c:${HAZ.cold.color}">Cold threshold ${esc(num(a.assessments.cold.threshold))} &deg;C</span>
                 </div>
             </div>
             <div class="prov">
@@ -318,14 +381,14 @@ function renderEvidence() {
                 <dl>
                     <div><dt>Source</dt><dd>${isForecast ? `<a href="https://open-meteo.com/" target="_blank" rel="noopener">${esc(src.provider)}</a>` : esc(src.provider)}</dd></div>
                     <div><dt>Dataset</dt><dd>${esc(src.dataset)}</dd></div>
-                    <div><dt>Location</dt><dd>${esc(inc.location)} (${esc(src.location.lat)}, ${esc(src.location.lon)})</dd></div>
-                    <div><dt>${isForecast ? "Forecast window" : "Observation window"}</dt><dd>${esc(fmtDate8(src.window.start))} to ${esc(fmtDate8(src.window.end))}
+                    <div><dt>Location</dt><dd>${esc(heat.location)} (${esc(loc.lat)}, ${esc(loc.lon)})</dd></div>
+                    <div><dt>${isForecast ? "Forecast window" : "Observation window"}</dt><dd>${esc(isForecast ? fmtTime(win.start) : fmtDate8(win.start))} to ${esc(isForecast ? fmtTime(win.end) : fmtDate8(win.end))}
                         <span class="muted">(${esc(d.observation_start ? fmtTime(d.observation_start) : "n/a")} to ${esc(fmtTime(d.observation_end))})</span></dd></div>
                     <div><dt>Time standard</dt><dd>${esc(src.time_standard)} ${src.time_standard_origin ? `<span class="muted">(${esc(src.time_standard_origin)})</span>` : ""}</dd></div>
                     <div><dt>Data kind</dt><dd>${esc(kindLabel)}</dd></div>
                     <div><dt>Retrieved at</dt><dd>${esc(src.retrieved_at || "not recorded")}</dd></div>
-                    <div><dt>Data status</dt><dd>${isForecast ? "Forecast model output, not live sensor readings or an official warning." : "Historical data, not a live observation."}</dd></div>
-                    <div><dt>Missing data</dt><dd>Invalid values are excluded from statistics and break a ${state.hazard === "cold" ? "cold" : "hot"} streak. ${esc(d.missing_observations)} of ${esc(d.expected_observations)} hours missing here.</dd></div>
+                    <div><dt>Data status</dt><dd>${isForecast ? "Forecast model output, not live sensor readings or an official warning." : "Historical data, not a live observation. Hourly values are model-based estimates; EcoOps does not create hourly values the source did not provide."}</dd></div>
+                    <div><dt>Missing data</dt><dd>Invalid or missing hours are excluded from statistics and break a heat or cold streak. ${esc(d.missing_observations)} of ${esc(d.expected_observations)} hours missing here.</dd></div>
                 </dl>
                 <div class="tag-legend" aria-label="Value types used in this app">
                     <span class="tag t-observed">Observed</span>
@@ -340,19 +403,22 @@ function renderEvidence() {
 }
 
 function drawChart() {
-    const inc = state.incident;
+    const a = state.assessment;
     const src = state.source;
-    const series = inc.details.series;
-    const thr = inc.threshold;
-    const heatThr = Number(state.assessment?.heat?.threshold ?? 35);
-    const coldThr = Number(state.assessment?.cold?.threshold ?? 5);
-    const isCold = state.hazard === "cold";
-    const atTrigger = (value, hazard) => hazard === "cold" ? value <= coldThr : value >= heatThr;
-    const thresholdPhrase = isCold ? "at or below" : "at or above";
+    const heat = a.assessments.heat;
+    const cold = a.assessments.cold;
+    const series = (heat.details && heat.details.series) || [];
     const n = series.length;
-    if (!n) return;
+    const box = $("chart");
+    if (!n || series.every((p) => p.temp_c === null)) {
+        box.innerHTML = `<div class="empty"><p>No valid hourly temperatures to plot.</p></div>`;
+        return;
+    }
+    const heatThr = Number(heat.threshold);
+    const coldThr = Number(cold.threshold);
+    const atTrigger = (value, hazard) => (hazard === "cold" ? value <= coldThr : value >= heatThr);
 
-    const W = 900, H = 320, ml = 52, mr = 18, mt = 22, mb = 44;
+    const W = 900, H = 340, ml = 58, mr = 18, mt = 22, mb = 56;
     const vals = series.map((p) => p.temp_c).filter((v) => v !== null);
     const yMin = Math.floor(Math.min(...vals, heatThr, coldThr) - 2);
     const yMax = Math.ceil(Math.max(...vals, heatThr, coldThr) + 2);
@@ -369,25 +435,35 @@ function drawChart() {
                  <text class="axis-label" x="${ml - 8}" y="${y(t) + 4}" text-anchor="end">${t}</text>`;
     }
 
+    // Label spacing adapts to the window length so 7-day forecasts stay legible.
+    const labelEvery = n > 120 ? 12 : 6;
     let xticks = "";
     series.forEach((p, i) => {
         const hour = parseInt(p.time.slice(11, 13), 10);
-        if (hour % 6 === 0) {
+        if (hour % labelEvery === 0) {
             xticks += `<line x1="${x(i)}" x2="${x(i)}" y1="${H - mb}" y2="${H - mb + 5}" stroke="#5f6a78" />
                        <text class="axis-label" x="${x(i)}" y="${H - mb + 18}" text-anchor="middle">${p.time.slice(11, 16)}</text>`;
             if (hour === 0) {
-                xticks += `<text class="axis-label" x="${x(i)}" y="${H - mb + 33}" text-anchor="middle" style="fill:#e8ebf0">${p.time.slice(5, 10)}</text>`;
+                xticks += `<text class="axis-label" x="${x(i)}" y="${H - mb + 32}" text-anchor="middle" style="fill:#e8ebf0">${p.time.slice(5, 10)}</text>`;
             }
         }
     });
+    const axisTitles = `
+        <text class="axis-label" x="${(ml + W - mr) / 2}" y="${H - 6}" text-anchor="middle">Time (${esc(src.time_standard)}), hourly</text>
+        <text class="axis-label" transform="translate(14 ${(mt + H - mb) / 2}) rotate(-90)" text-anchor="middle">Temperature (&deg;C)</text>`;
 
-    const shades = inc.details.qualifying_streaks.map((s) => {
-        const i0 = indexOf[s.start], i1 = indexOf[s.end];
-        const left = Math.max(ml, x(i0) - step / 2);
-        const right = Math.min(W - mr, x(i1) + step / 2);
-        return `<rect x="${left}" y="${mt}" width="${right - left}" height="${H - mt - mb}" fill="rgba(255,91,58,0.13)" stroke="rgba(255,91,58,0.5)" stroke-dasharray="3 3" />
-                <text class="axis-label" x="${(left + right) / 2}" y="${mt + 12}" text-anchor="middle" style="fill:#ff5b3a">${s.hours} h</text>`;
-    }).join("");
+    const shadeFor = (inc) => {
+        const hz = HAZ[hazardOf(inc)];
+        if (!isRisk(inc)) return "";
+        return (inc.details.qualifying_streaks || []).map((s) => {
+            const i0 = indexOf[s.start], i1 = indexOf[s.end];
+            if (i0 === undefined || i1 === undefined) return "";
+            const left = Math.max(ml, x(i0) - step / 2);
+            const right = Math.min(W - mr, x(i1) + step / 2);
+            return `<rect x="${left}" y="${mt}" width="${right - left}" height="${H - mt - mb}" fill="${hz.soft}" stroke="${hz.color}" stroke-opacity="0.55" stroke-dasharray="3 3" />
+                <text class="axis-label" x="${(left + right) / 2}" y="${mt + 12}" text-anchor="middle" style="fill:${hz.color}">${esc(hz.name)} ${s.hours} h</text>`;
+        }).join("");
+    };
 
     let basePath = "";
     let hotPath = "";
@@ -399,10 +475,8 @@ function drawChart() {
         open = true;
         const prev = series[i - 1];
         if (prev && prev.temp_c !== null) {
-            const heatSegment = atTrigger(prev.temp_c, "heat") && atTrigger(p.temp_c, "heat");
-            const coldSegment = atTrigger(prev.temp_c, "cold") && atTrigger(p.temp_c, "cold");
-            if (heatSegment) hotPath += `M${x(i - 1)} ${y(prev.temp_c)} L${x(i)} ${y(p.temp_c)} `;
-            if (coldSegment) coldPath += `M${x(i - 1)} ${y(prev.temp_c)} L${x(i)} ${y(p.temp_c)} `;
+            if (atTrigger(prev.temp_c, "heat") && atTrigger(p.temp_c, "heat")) hotPath += `M${x(i - 1)} ${y(prev.temp_c)} L${x(i)} ${y(p.temp_c)} `;
+            if (atTrigger(prev.temp_c, "cold") && atTrigger(p.temp_c, "cold")) coldPath += `M${x(i - 1)} ${y(prev.temp_c)} L${x(i)} ${y(p.temp_c)} `;
         }
     });
 
@@ -410,34 +484,37 @@ function drawChart() {
         ? `<line x1="${x(i)}" x2="${x(i)}" y1="${mt}" y2="${H - mb}" stroke="#5f6a78" stroke-dasharray="2 4" /><text class="axis-label" x="${x(i)}" y="${H - mb - 6}" text-anchor="middle">missing</text>`
         : "")).join("");
 
-    const markerTime = isCold ? inc.details.min_time : inc.details.peak_time;
-    const markerTemp = isCold ? inc.details.min_temp : inc.max_temp;
-    const peakIdx = indexOf[markerTime];
-    const peak = peakIdx === undefined ? "" : `
-        <circle cx="${x(peakIdx)}" cy="${y(markerTemp)}" r="5" fill="#0b0d10" stroke="#e8ebf0" stroke-width="2" />
-        <text class="axis-label" x="${x(peakIdx)}" y="${y(markerTemp) - 10}" text-anchor="middle" style="fill:#e8ebf0">${num(markerTemp)} &deg;C</text>`;
+    const mark = (time, temp, above) => {
+        const i = indexOf[time];
+        if (i === undefined || temp === null || temp === undefined) return "";
+        return `<circle cx="${x(i)}" cy="${y(temp)}" r="4.5" fill="#0b0d10" stroke="#e8ebf0" stroke-width="2" />
+            <text class="axis-label" x="${x(i)}" y="${y(temp) + (above ? -10 : 17)}" text-anchor="middle" style="fill:#e8ebf0">${num(temp)} &deg;C</text>`;
+    };
+    const markers = mark(heat.details.peak_time, heat.max_temp, true) + mark(cold.details.min_time, cold.details.min_temp, false);
 
-    $("chart").innerHTML = `
+    box.innerHTML = `
         <svg viewBox="0 0 ${W} ${H}" role="img"
-             aria-label="Hourly temperature from ${esc(fmtTime(series[0].time))} to ${esc(fmtTime(series[n - 1].time))}. Longest streak ${thresholdPhrase} ${esc(thr)} degrees: ${esc(inc.hot_streak_hours)} hours.">
+             aria-label="Hourly temperature in degrees Celsius from ${esc(fmtTime(series[0].time))} to ${esc(fmtTime(series[n - 1].time))}, with a heat threshold at ${esc(num(heatThr))} degrees and a cold threshold at ${esc(num(coldThr))} degrees. Longest heat run ${esc(heat.streak_hours)} hours; longest cold run ${esc(cold.streak_hours)} hours.">
             ${grid}
-            ${shades}
-            <line x1="${ml}" x2="${W - mr}" y1="${y(heatThr)}" y2="${y(heatThr)}" stroke="#ff5b3a" stroke-dasharray="6 5" stroke-width="1.5" />
-            <text class="axis-label" x="${W - mr}" y="${y(heatThr) - 6}" text-anchor="end" style="fill:#ff8a70">Heat ${esc(heatThr)} &deg;C</text>
-            <line x1="${ml}" x2="${W - mr}" y1="${y(coldThr)}" y2="${y(coldThr)}" stroke="#60a5fa" stroke-dasharray="6 5" stroke-width="1.5" />
-            <text class="axis-label" x="${W - mr}" y="${y(coldThr) - 6}" text-anchor="end" style="fill:#60a5fa">Cold ${esc(coldThr)} &deg;C</text>
+            ${shadeFor(heat)}
+            ${shadeFor(cold)}
+            <line x1="${ml}" x2="${W - mr}" y1="${y(heatThr)}" y2="${y(heatThr)}" stroke="${HAZ.heat.color}" stroke-dasharray="${HAZ.heat.dash}" stroke-width="1.5" />
+            <text class="axis-label" x="${W - mr}" y="${y(heatThr) - 6}" text-anchor="end" style="fill:#ff8a70">Heat ${esc(num(heatThr))} &deg;C</text>
+            <line x1="${ml}" x2="${W - mr}" y1="${y(coldThr)}" y2="${y(coldThr)}" stroke="${HAZ.cold.color}" stroke-dasharray="${HAZ.cold.dash}" stroke-width="1.5" />
+            <text class="axis-label" x="${W - mr}" y="${y(coldThr) - 6}" text-anchor="end" style="fill:${HAZ.cold.color}">Cold ${esc(num(coldThr))} &deg;C</text>
             ${missing}
             <path d="${basePath}" fill="none" stroke="#cfd6df" stroke-width="1.6" stroke-linejoin="round" />
-            <path d="${hotPath}" fill="none" stroke="#ff5b3a" stroke-width="2.8" stroke-linejoin="round" />
-            <path d="${coldPath}" fill="none" stroke="#60a5fa" stroke-width="2.8" stroke-linejoin="round" />
+            <path d="${hotPath}" fill="none" stroke="${HAZ.heat.color}" stroke-width="2.8" stroke-linejoin="round" />
+            <path d="${coldPath}" fill="none" stroke="${HAZ.cold.color}" stroke-width="2.8" stroke-linejoin="round" />
             ${xticks}
-            ${peak}
+            ${axisTitles}
+            ${markers}
             <line id="guide" x1="0" x2="0" y1="${mt}" y2="${H - mb}" stroke="#8f9aa9" stroke-width="1" visibility="hidden" />
             <circle id="guide-dot" r="4" fill="#2dd4bf" visibility="hidden" />
             <rect id="hit" x="${ml}" y="${mt}" width="${W - ml - mr}" height="${H - mt - mb}" fill="transparent" />
         </svg>`;
 
-    const svg = $("chart").querySelector("svg");
+    const svg = box.querySelector("svg");
     const guide = $("guide");
     const dot = $("guide-dot");
     const readout = $("readout");
@@ -457,8 +534,11 @@ function drawChart() {
             dot.setAttribute("cx", x(i));
             dot.setAttribute("cy", y(p.temp_c));
             dot.setAttribute("visibility", "visible");
+            const notes = [];
+            if (atTrigger(p.temp_c, "heat")) notes.push(`heat trigger reached: at or above ${num(heatThr)} °C`);
+            if (atTrigger(p.temp_c, "cold")) notes.push(`cold trigger reached: at or below ${num(coldThr)} °C`);
             readout.textContent = `${fmtTime(p.time)} ${src.time_standard}: ${p.temp_c.toFixed(1)} °C` +
-                (atTrigger(p.temp_c) ? `  (trigger reached: ${thresholdPhrase} ${thr} °C)` : "");
+                (notes.length ? `  (${notes.join("; ")})` : "");
         }
     };
     const leave = () => {
@@ -473,53 +553,32 @@ function drawChart() {
 
 /* ---------- investigation ---------- */
 
-async function runInvestigation() {
-    const root = $("investigate-root");
-    root.innerHTML = loadingBlock("Checking evidence and running the configured investigator...");
+const SECTION_DEFS = (forecastMode) => [
+    ["observed_facts", forecastMode ? "Forecast facts" : "Observed facts", "observed", forecastMode ? "Forecast" : "Observed", forecastMode ? "Values supplied by the forecast model, not measured observations." : "Values read directly from the supplied data."],
+    ["derived_metrics", "Derived metrics", "derived", "Derived", "Calculated from the observations by a stated rule."],
+    ["operational_assumptions", "Operational assumptions", "assumed", "Assumed", "Not measured. Planning and interpretation limits."],
+    ["recommended_actions", "Recommended actions", "recommended", "Recommended", "Suggestions to consider, not official instructions."],
+];
 
-    let data;
-    try {
-        data = await api(modePath("/investigate"));
-    } catch (err) {
-        root.innerHTML = errorBlock("Investigation failed", err.message, "investigate");
-        return;
+function investigationBlock(inc, outcome, idx) {
+    const hz = HAZ[hazardOf(inc)];
+    const head = `
+        <div class="inv-head hz-${hazardOf(inc)}">
+            <h3><span class="swatch" style="background:${hz.color}"></span>${hz.name} risk investigation</h3>
+            <span class="badge sev-${esc(inc.severity)}">${esc(inc.severity)}</span>
+            <span class="fine">${esc(inc.incident_id)}</span>
+        </div>`;
+    if (outcome.status === "rejected") {
+        return `<section class="inv-block" data-inv="${idx}">${head}${errorBlock(`${hz.name} investigation failed`, outcome.reason.message, "investigate")}</section>`;
     }
-
-    const inv = data.investigation;
-    const forecastMode = state.mode === "forecast";
-    const sectionDefs = [
-        ["observed_facts", forecastMode ? "Forecast facts" : "Observed facts", "observed", forecastMode ? "Forecast" : "Observed", forecastMode ? "Values supplied by the forecast model, not measured observations." : "Values read directly from the supplied data."],
-        ["derived_metrics", "Derived metrics", "derived", "Derived", "Calculated from the observations by a stated rule."],
-        ["operational_assumptions", "Operational assumptions", "assumed", "Assumed", "Not measured. Planning and interpretation limits."],
-        ["recommended_actions", "Recommended actions", "recommended", "Recommended", "Suggestions to consider, not official instructions."],
-    ];
-
+    const inv = outcome.value.investigation;
     const isStrands = inv.investigation_mode === "strands_ollama";
     const modeDescription = isStrands
-        ? "Deterministic evidence checks plus a local Strands agent brief. Review AI-generated wording before acting."
+        ? "Deterministic evidence checks plus a local Strands agent brief. The detector, not the agent, decides what qualified. Review AI-generated wording before acting."
         : inv.investigation_mode === "deterministic_fallback"
             ? "Strands/Ollama could not run. Deterministic evidence checks are shown instead; no agent brief was generated."
             : "Fixed rules applied to the evidence. This is not an AI agent.";
-
-    root.innerHTML = `
-        <p class="mode">Mode: <strong>${esc(inv.investigation_mode.replaceAll("_", " "))}</strong>.
-            ${esc(modeDescription)}</p>
-        ${inv.fallback_reason ? `<p class="fine">${esc(inv.fallback_reason)}</p>` : ""}
-        ${inv.agent_brief ? `<div class="card agent-brief"><div class="card-head"><h3>Strands agent brief</h3><span class="tag t-recommended">AI-generated</span></div><p>${esc(inv.agent_brief.text)}</p><p class="basis">${esc(inv.agent_brief.basis)}</p></div>` : ""}
-        <ol class="checks" id="checks">
-            ${inv.checks.map((c) => `
-                <li class="check"><span class="mark" aria-hidden="true"></span>
-                    <div><div>${esc(c.label)}</div><div class="result">${esc(c.result)}</div></div></li>`).join("")}
-        </ol>
-        <div class="sections" id="inv-sections" hidden></div>`;
-
-    for (const el of root.querySelectorAll(".check")) {
-        await sleep(180);
-        el.classList.add("done");
-    }
-
-    const sections = $("inv-sections");
-    sections.innerHTML = sectionDefs.map(([key, title, cls, tagText, blurb]) => {
+    const sections = SECTION_DEFS(state.mode === "forecast").map(([key, title, cls, tagText, blurb]) => {
         const items = inv[key] || [];
         return `
             <div class="card">
@@ -530,7 +589,41 @@ async function runInvestigation() {
                 : `<p class="fine">Nothing to report.</p>`}
             </div>`;
     }).join("");
-    sections.hidden = false;
+    return `
+        <section class="inv-block" data-inv="${idx}">
+            ${head}
+            <p class="mode">Mode: <strong>${esc(String(inv.investigation_mode).replaceAll("_", " "))}</strong>. ${esc(modeDescription)}</p>
+            ${inv.fallback_reason ? `<p class="fine">${esc(inv.fallback_reason)}</p>` : ""}
+            ${inv.qualification ? `<p class="qualified"><strong>Why it qualified:</strong> ${esc(inv.qualification)}</p>` : ""}
+            ${inv.agent_brief ? `<div class="card agent-brief"><div class="card-head"><h3>Strands agent brief</h3><span class="tag t-recommended">AI-generated</span></div><p>${esc(inv.agent_brief.text)}</p><p class="basis">${esc(inv.agent_brief.basis)}</p></div>` : ""}
+            <ol class="checks">
+                ${(inv.checks || []).map((c) => `
+                    <li class="check"><span class="mark" aria-hidden="true"></span>
+                        <div><div>${esc(c.label)}</div><div class="result">${esc(c.result)}</div></div></li>`).join("")}
+            </ol>
+            <div class="sections">${sections}</div>
+        </section>`;
+}
+
+async function runInvestigation() {
+    const root = $("investigate-root");
+    const incidents = state.incidents.slice();
+    if (!incidents.length) return;
+    root.innerHTML = loadingBlock("Checking evidence and running the configured investigator...");
+
+    const outcomes = await Promise.allSettled(
+        incidents.map((inc) => api(modePath("/investigate", hazardOf(inc))))
+    );
+    if (outcomes.every((o) => o.status === "rejected")) {
+        root.innerHTML = errorBlock("Investigation failed", outcomes[0].reason.message, "investigate");
+        return;
+    }
+    root.innerHTML = incidents.map((inc, i) => investigationBlock(inc, outcomes[i], i)).join("");
+
+    for (const el of root.querySelectorAll(".check")) {
+        await sleep(90);
+        el.classList.add("done");
+    }
 
     state.stage.investigated = true;
     updatePipeline();
@@ -538,13 +631,32 @@ async function runInvestigation() {
 
 /* ---------- response plan ---------- */
 
+function planCard(a) {
+    return `
+        <article class="action-card hz-${esc(a.hazard)}">
+            <div class="action-id">${esc(a.action_id)}</div>
+            <div>
+                <h3>${esc(a.name)}</h3>
+                <p>${esc(a.reason)}</p>
+                <div class="chips">
+                    <span class="chip ${a.hazard === "cold" ? "cold" : "hot"}">${esc(HAZ[a.hazard] ? HAZ[a.hazard].name : a.hazard)}</span>
+                    <span class="chip">${esc(a.resource)}</span>
+                    <span class="chip warn">${esc(a.teams_required)} team${a.teams_required > 1 ? "s" : ""}</span>
+                    <span class="chip warn">${esc(a.budget_units)} budget units</span>
+                    <span class="chip warn">${esc(a.duration_hours)} h</span>
+                </div>
+            </div>
+            <span class="tag t-recommended">${esc(String(a.status).toLowerCase())}</span>
+        </article>`;
+}
+
 async function generatePlan() {
     const root = $("plan-root");
     root.innerHTML = loadingBlock("Generating response plan...");
 
     let plan;
     try {
-        plan = await api(modePath("/response"));
+        plan = await api(modePath("/response", "all"));
     } catch (err) {
         root.innerHTML = errorBlock("Could not generate the plan", err.message, "plan");
         return;
@@ -552,35 +664,30 @@ async function generatePlan() {
 
     state.plan = plan;
 
-    if (plan.status !== "RESPONSE_RECOMMENDED") {
-        const hazardName = state.hazard === "cold" ? "cold" : "heat";
-        root.innerHTML = `<div class="empty"><p>No response plan is needed: ${state.mode === "forecast" ? `the available forecast did not meet the configured ${hazardName}-risk trigger` : `no sustained ${hazardName} event was detected in this historical window`}.</p></div>`;
+    if (plan.status !== "RESPONSE_RECOMMENDED" || !Array.isArray(plan.actions) || !plan.actions.length) {
+        root.innerHTML = plan.status === "ASSESSMENT_UNAVAILABLE"
+            ? `<div class="empty"><p>No plan can be generated because the temperature data could not be assessed.</p></div>`
+            : `<div class="empty"><p>No response plan is needed: ${state.mode === "forecast" ? "the available forecast did not meet the configured heat or cold trigger" : "no sustained heat or cold event was detected in this historical window"}.</p></div>`;
         return;
     }
 
     state.order = plan.actions.slice().sort((a, b) => a.priority - b.priority).map((a) => a.action_id);
     state.selected = new Set(state.order);
 
+    const groups = (plan.plans || []).map((p) => {
+        const hz = HAZ[p.hazard] || HAZ.heat;
+        return `
+            <div class="plan-group hz-${esc(p.hazard)}">
+                <h3 class="plan-group-title"><span class="swatch" style="background:${hz.color}"></span>${hz.name} response plan
+                    <span class="fine">${esc(p.incident_id)} &middot; ${esc(p.trigger.severity)}</span></h3>
+                <div class="action-list">${p.actions.map(planCard).join("")}</div>
+            </div>`;
+    }).join("");
+
     root.innerHTML = `
         <div class="notice">${esc(plan.disclaimer)}</div>
         <div class="notice assumed"><span class="tag t-assumed">Assumed</span>&nbsp; ${esc(plan.assumption_note)}</div>
-        <div class="action-list">
-            ${plan.actions.map((a) => `
-                <article class="action-card">
-                    <div class="action-id">${esc(a.action_id)}</div>
-                    <div>
-                        <h3>${esc(a.name)}</h3>
-                        <p>${esc(a.reason)}</p>
-                        <div class="chips">
-                            <span class="chip">${esc(a.resource)}</span>
-                            <span class="chip warn">${esc(a.teams_required)} team${a.teams_required > 1 ? "s" : ""}</span>
-                            <span class="chip warn">${esc(a.budget_units)} budget units</span>
-                            <span class="chip warn">${esc(a.duration_hours)} h</span>
-                        </div>
-                    </div>
-                    <span class="tag t-recommended">${esc(a.status.toLowerCase())}</span>
-                </article>`).join("")}
-        </div>`;
+        ${groups}`;
 
     state.stage.planned = true;
     updatePipeline();
@@ -591,8 +698,10 @@ async function generatePlan() {
 
 function buildSimulation() {
     $("simulate-root").innerHTML = `
-        <div class="notice">Simulates operational resource allocation only. It does not predict temperature
-            reduction, health outcomes or real-world effectiveness.</div>
+        <div class="notice">Simulates operational resource allocation only, across every action in the combined plan.
+            It does not predict temperature reduction, health outcomes or real-world effectiveness.</div>
+        <div class="notice assumed"><span class="tag t-assumed">Hypothetical</span>&nbsp; Teams, budget and window are
+            planning inputs you set here. They are not data about any real teams, facilities or funds.</div>
         <div class="sim-grid">
             <div class="controls">
                 <div class="slider-row">
@@ -650,7 +759,7 @@ function renderOrderList() {
                 <input type="checkbox" data-select="${esc(id)}" ${on ? "checked" : ""}
                        aria-label="Include ${esc(a.name)}">
                 <div>${esc(id)} &middot; ${esc(a.name)}
-                    <span class="meta">${esc(a.teams_required)} team${a.teams_required > 1 ? "s" : ""} &middot; ${esc(a.budget_units)} units &middot; ${esc(a.duration_hours)} h</span>
+                    <span class="meta">${esc(a.hazard)} &middot; ${esc(a.teams_required)} team${a.teams_required > 1 ? "s" : ""} &middot; ${esc(a.budget_units)} units &middot; ${esc(a.duration_hours)} h</span>
                 </div>
                 <div class="move">
                     <button data-action="move-up" data-id="${esc(id)}" ${i === 0 ? "disabled" : ""} aria-label="Move ${esc(id)} up">&uarr;</button>
@@ -680,7 +789,7 @@ async function runSimulation() {
     };
 
     try {
-        const data = await api(modePath("/simulate"), { method: "POST", body: JSON.stringify(request) });
+        const data = await api(modePath("/simulate", "all"), { method: "POST", body: JSON.stringify(request) });
         if (seq !== state.simSeq) return;
         state.sim = { request, ...data };
         renderSimResult();
