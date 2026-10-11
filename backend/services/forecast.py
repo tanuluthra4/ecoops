@@ -20,7 +20,7 @@ TIMEZONE = "Asia/Kolkata"
 INDIA_TZ = timezone(timedelta(hours=5, minutes=30), name="IST")
 FORECAST_DAYS = 7
 _cache = {}
-CACHE_SECONDS = 600
+CACHE_SECONDS = 3600
 
 
 def clear_forecast_cache():
@@ -41,7 +41,7 @@ def _unavailable_source(note):
 def load_forecast_bundle(refresh=False):
     """Return a forecast in the detector's expected hourly-grid format."""
     now_mono = time.monotonic()
-    if not refresh and "bundle" in _cache and now_mono - _cache["at"] < CACHE_SECONDS:
+    if "bundle" in _cache and now_mono - _cache["at"] < CACHE_SECONDS:
         return _cache["bundle"]
 
     params = {
